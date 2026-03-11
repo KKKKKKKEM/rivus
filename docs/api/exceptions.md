@@ -16,6 +16,7 @@ BaseException
         ├── PipelineError           # Pipeline 级别失败
         ├── PipelineTimeoutError    # Pipeline 执行超时
         ├── PipelineStop            # 节点主动触发的优雅停止（非失败）
+        ├── NodeSkip                # 节点主动丢弃当前 item（非失败）
         └── ContextKeyError         # 访问 Context 中不存在的必选键
 ```
 
@@ -131,6 +132,47 @@ except PipelineStop:
 
 ---
 
+## `NodeSkip`
+
+节点内**主动丢弃当前 item** 的信号。不记为错误，Pipeline 继续处理其余 item。
+
+```python
+class NodeSkip(RivusError):
+    message: str    # 跳过原因
+```
+
+当节点抛出 `NodeSkip` 时：
+
+- 当前 item **不会**流入下游节点
+- 不记录到 `report.errors`
+- `report.nodes[i].items_skipped` 累计 +1
+- `report.results` 中不包含该 item
+
+```python
+@rivus.node
+def validate(ctx: rivus.Context):
+    item = ctx.require("input")
+    if item["score"] < 0.5:
+        raise rivus.NodeSkip(f"过滤掉低质量 item: score={item['score']}")
+    return item
+
+@rivus.node
+def process(ctx: rivus.Context):
+    # 只有 score >= 0.5 的 item 才会到达这里
+    return transform(ctx.require("input"))
+
+pipeline = rivus.Pipeline("filter") | validate | process
+report = pipeline.run(*items)
+
+# 查看 filter 节点的跳过数量
+validate_report = report.nodes[0]
+print(f"跳过了 {validate_report.items_skipped} 个 item")
+```
+
+> **注意**：`NodeSkip` 由 Pipeline worker 线程内部捕获，**不会传播到 `run()` 调用处**。
+
+---
+
 ## `ContextKeyError`
 
 访问 `Context` 中不存在的必选键时（调用 `ctx.require("key")` 或 `ctx["key"]`）抛出。
@@ -149,6 +191,7 @@ except rivus.ContextKeyError as e:
 ```
 
 **常见原因**：
+
 - 节点依赖的数据未通过 `initial=` 注入
 - 上游节点未设置预期的输出键
 - 误用了 `ctx.require()` 替代 `ctx.get()`（键确实可选时应用 `get`）
@@ -188,10 +231,11 @@ else:
 
 ## 异常与 Pipeline 状态对照
 
-| 异常 | 触发条件 | `report.status` | 是否从 `run()` 抛出 |
-|------|---------|----------------|---------------------|
-| `NodeError` | 节点函数抛出任意异常 | `"failed"` | 仅 `fail_fast=True` 时包装在 `PipelineError` 中抛出 |
-| `PipelineError` | `fail_fast=True` 且有 `NodeError` | `"failed"` | 是 |
-| `PipelineTimeoutError` | 超过 `timeout` | `"timeout"` | 是 |
-| `PipelineStop` | 节点内 `ctx.stop()` | `"stopped"` | 否（框架内部捕获） |
-| `ContextKeyError` | `ctx.require(key)` 且 key 不存在 | `"failed"` | 同 `NodeError` |
+| 异常                   | 触发条件                          | `report.status`        | 是否从 `run()` 抛出                                 |
+| ---------------------- | --------------------------------- | ---------------------- | --------------------------------------------------- |
+| `NodeError`            | 节点函数抛出任意异常              | `"failed"`             | 仅 `fail_fast=True` 时包装在 `PipelineError` 中抛出 |
+| `PipelineError`        | `fail_fast=True` 且有 `NodeError` | `"failed"`             | 是                                                  |
+| `PipelineTimeoutError` | 超过 `timeout`                    | `"timeout"`            | 是                                                  |
+| `PipelineStop`         | 节点内 `ctx.stop()`               | `"stopped"`            | 否（框架内部捕获）                                  |
+| `NodeSkip`             | 节点内 `raise NodeSkip()`         | 不影响，仃为 `SUCCESS` | 否（框架内部捕获）                                  |
+| `ContextKeyError`      | `ctx.require(key)` 且 key 不存在  | `"failed"`             | 同 `NodeError`                                      |

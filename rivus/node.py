@@ -36,7 +36,6 @@ from typing import Any, Callable
 
 from rivus.context import Context
 
-
 # ---------------------------------------------------------------------------
 # 函数式节点
 # ---------------------------------------------------------------------------
@@ -99,6 +98,7 @@ class Node:
         setup_fn: Callable[[Context], None] | None = None,
         concurrency_type: str = "thread",
         gather: bool = False,
+        once: bool = False,
     ) -> None:
         if workers < 1:
             raise ValueError(f"workers must be >= 1, got {workers}")
@@ -113,6 +113,7 @@ class Node:
         self.setup_fn = setup_fn
         self.concurrency_type = concurrency_type
         self.gather = gather
+        self.once = once
         self.is_generator = inspect.isgeneratorfunction(fn)
 
     def __repr__(self) -> str:
@@ -181,6 +182,7 @@ class BaseNode(ABC):
     queue_size: int = 0
     concurrency_type: str = "thread"  # "thread" 或 "process"
     gather: bool = False  # True → 本节点前插入屏障，等上游全量结果后聚合为列表传入
+    once: bool = False   # True → 节点在 Pipeline 生命周期内只执行一次，后续 run 跳过
 
     def setup(self, ctx: Context) -> None:
         """流水线启动时调用一次（可选重写）。
@@ -208,6 +210,7 @@ class BaseNode(ABC):
             setup_fn=self.setup,
             concurrency_type=self.concurrency_type,
             gather=getattr(self, "gather", False),
+            once=getattr(self, "once", False),
         )
 
 
@@ -225,6 +228,7 @@ def node(
     setup: Callable[[Context], None] | None = None,
     concurrency_type: str = "thread",
     gather: bool = False,
+    once: bool = False,
 ) -> Any:
     """将函数装饰为 :class:`Node` 实例。
 
@@ -278,6 +282,9 @@ def node(
             可调用对象），适合 CPU 密集型任务；线程模式适合 I/O 密集型。
         gather: 若为 ``True``，在本节点前插入同步屏障：收集上游所有 item
                 的结果值组成 ``list``，以单个 item 传入本节点。
+        once: 若为 ``True``，该节点在整个 Pipeline 生命周期内只执行一次
+              （首次 ``run()`` 时执行，后续 ``run()`` 直接透传 item），
+              适合做模型加载、数据库初始化等幂等初始化操作。
 
     Returns:
         :class:`Node` 实例（可直接用于 ``Pipeline | node_instance``）。
@@ -286,7 +293,7 @@ def node(
     def decorator(f: Callable) -> Node:
         n = Node(f, name=name, workers=workers,
                  queue_size=queue_size, setup_fn=setup,
-                 concurrency_type=concurrency_type, gather=gather)
+                 concurrency_type=concurrency_type, gather=gather, once=once)
         functools.update_wrapper(n, f)  # type: ignore[arg-type]
         return n
 

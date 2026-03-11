@@ -59,6 +59,7 @@ from typing import Any, Callable, Iterable
 from rivus.context import Context
 from rivus.exceptions import (
     NodeError,
+    NodeSkip,
     PipelineError,
     PipelineStop,
     PipelineTimeoutError,
@@ -99,6 +100,7 @@ class NodeReport:
     concurrency_type: str = "thread"
     items_in: int = 0
     items_out: int = 0
+    items_skipped: int = 0
     errors: int = 0
     total_time_s: float = 0.0
     min_time_s: float = float("inf")
@@ -185,10 +187,13 @@ def _mp_run(
     import time as _time
 
     from rivus.context import Context as _Context
-
+    from rivus.exceptions import NodeSkip as _NodeSkip
     ctx = _Context(data_dict)
     t0 = _time.perf_counter()
-    result = fn(ctx)
+    try:
+        result = fn(ctx)
+    except _NodeSkip as _skip:
+        return ("skip", _skip.message, _time.perf_counter() - t0)
     if is_gen or _inspect.isgenerator(result):
         items = []
         for v in result:
@@ -348,6 +353,16 @@ class Pipeline:
         self._seq_lock = threading.Lock()
         self._start_time: float = 0.0
 
+        # once 节点：记录已执行过一次的节点索引
+        self._once_executed: set[int] = set()
+
+        # 生命周期钩子
+        self._init_done: bool = False
+        self._hooks_init: list[Callable] = []
+        self._hooks_start: list[Callable] = []
+        self._hooks_end: list[Callable] = []
+        self._hooks_failure: list[Callable] = []
+
         self._ctx._attach_stop_event(self._stop_event)
 
     # ------------------------------------------------------------------
@@ -381,6 +396,64 @@ class Pipeline:
     def __or__(self, n: "Node | BaseNode") -> "Pipeline":
         """管道符语法：``pipeline | node_or_base_node``。"""
         return self.add_node(n)
+
+    # ------------------------------------------------------------------
+    # 生命周期钩子
+    # ------------------------------------------------------------------
+
+    def on_init(self, fn: Callable) -> Callable:
+        """注册初始化钩子，在首次 ``run()`` 前调用一次。
+
+        可用作装饰器或直接调用::
+
+            @pipeline.on_init
+            def setup(ctx: Context):
+                ctx.set("model", load_model())
+
+            # 或
+            pipeline.on_init(lambda ctx: ctx.set("model", load_model()))
+
+        Args:
+            fn: 钩子函数，签名 ``(ctx: Context) -> None``。
+        """
+        self._hooks_init.append(fn)
+        return fn
+
+    def on_start(self, fn: Callable) -> Callable:
+        """注册运行开始钩子，每次 ``run()`` 开始时调用。
+
+        Args:
+            fn: 钩子函数，签名 ``(ctx: Context) -> None``。
+        """
+        self._hooks_start.append(fn)
+        return fn
+
+    def on_end(self, fn: Callable) -> Callable:
+        """注册运行成功结束钩子，每次 ``run()`` 成功完成后调用。
+
+        Args:
+            fn: 钩子函数，签名 ``(report: PipelineReport) -> None``。
+        """
+        self._hooks_end.append(fn)
+        return fn
+
+    def on_failure(self, fn: Callable) -> Callable:
+        """注册运行失败钩子，每次 ``run()`` 失败后调用。
+
+        Args:
+            fn: 钩子函数，签名 ``(report: PipelineReport) -> None``。
+        """
+        self._hooks_failure.append(fn)
+        return fn
+
+    def _fire_start_hooks(self) -> None:
+        """触发 init（首次）和 start（每次）钩子。"""
+        if not self._init_done:
+            self._init_done = True
+            for h in self._hooks_init:
+                h(self._ctx)
+        for h in self._hooks_start:
+            h(self._ctx)
 
     # ------------------------------------------------------------------
     # 状态查询
@@ -437,7 +510,8 @@ class Pipeline:
         *items,
         initial: dict[str, Any] | None = None,
         timeout: float | None = None,
-    ) -> PipelineReport:
+        repeat: int = 1,
+    ) -> "PipelineReport | list[PipelineReport]":
         """同步批量运行。
 
         Args:
@@ -449,11 +523,27 @@ class Pipeline:
             initial: 运行前写入 root Context 的初始数据（模型、配置等）。
             timeout: 最长执行时间（秒）；超时后自动 stop 并抛出
                      :class:`~rivus.exceptions.PipelineTimeoutError`。
+            repeat: 重复运行次数（默认 1）。
+                    当 ``repeat > 1`` 时，依次运行并返回 ``list[PipelineReport]``；
+                    每次都会触发 ``on_start`` / ``on_end`` / ``on_failure`` 钩子，
+                    ``on_init`` 仅在整个 Pipeline 生命周期内触发一次。
+
+        Returns:
+            ``repeat=1`` 时返回 :class:`PipelineReport`；
+            ``repeat>1`` 时返回 ``list[PipelineReport]``。
         """
+        if repeat < 1:
+            raise ValueError(f"repeat must be >= 1, got {repeat}")
+        if repeat > 1:
+            return [
+                self.run(*items, initial=initial, timeout=timeout)
+                for _ in range(repeat)
+            ]
         self._assert_idle()
         self._reset_state()
         if initial:
             self._ctx.update(initial)
+        self._fire_start_hooks()
         if timeout is not None:
             return self._run_with_timeout(items, timeout)
         self._boot_workers()
@@ -474,6 +564,7 @@ class Pipeline:
         self._reset_state()
         if initial:
             self._ctx.update(initial)
+        self._fire_start_hooks()
 
         def _target() -> None:
             self._boot_workers()
@@ -500,6 +591,7 @@ class Pipeline:
         self._reset_state()
         if initial:
             self._ctx.update(initial)
+        self._fire_start_hooks()
         self._boot_workers()
         with self._state_lock:
             self._status = PipelineStatus.RUNNING
@@ -718,6 +810,14 @@ class Pipeline:
                             nr.items_out += 1
                             nr._update_timing(time.perf_counter() - _t0)
 
+                except NodeSkip as skip_exc:
+                    with rc.errors_lock:
+                        nr.items_skipped += 1
+                    rc.root_ctx.log.debug(
+                        "Pipeline '%s' node '%s' skipped item: %s",
+                        rc.pipeline_name, nname, skip_exc.message,
+                    )
+
                 except PipelineStop as stop_exc:
                     rc.root_ctx.log.info(
                         "Pipeline '%s' stop requested by node '%s': %s",
@@ -767,7 +867,14 @@ class Pipeline:
                             res_type, res_data, elapsed = future.result()
                             with rc.errors_lock:
                                 nr._update_timing(elapsed)
-                            if res_type == "gen":
+                            if res_type == "skip":
+                                with rc.errors_lock:
+                                    nr.items_skipped += 1
+                                rc.root_ctx.log.debug(
+                                    "Pipeline '%s' node '%s' skipped item: %s",
+                                    rc.pipeline_name, nname, res_data,
+                                )
+                            elif res_type == "gen":
                                 for vtype, vdata in res_data:
                                     out_ctx = (
                                         self._ctx_from_dict(vdata, rc)
@@ -893,6 +1000,21 @@ class Pipeline:
                 log.error("Pipeline '%s' timed out after %.3fs.",
                           self.name, total_duration)
 
+            # ── 生命周期钩子 ──────────────────────────────────────────
+            hooks = (
+                self._hooks_end
+                if final_status == PipelineStatus.SUCCESS
+                else self._hooks_failure
+            )
+            for h in hooks:
+                try:
+                    h(self._report)
+                except Exception as hook_exc:
+                    log.warning(
+                        "Pipeline '%s': hook %r raised: %s",
+                        self.name, getattr(h, "__name__", h), hook_exc,
+                    )
+
             self._done_event.set()
 
         return threading.Thread(target=_collect, daemon=True, name=f"rivus-collector-{self.name}")
@@ -910,9 +1032,10 @@ class Pipeline:
         nodes = self._nodes
         n = len(nodes)
 
-        # ── 节点初始化（once per run）────────────────────────────────
-        for nd in nodes:
-            if nd.setup_fn is not None:
+        # ── 节点初始化 ────────────────────────────────────────────────
+        # once 节点：首次运行时调用 setup_fn，后续跳过
+        for i, nd in enumerate(nodes):
+            if nd.setup_fn is not None and not (nd.once and i in self._once_executed):
                 nd.setup_fn(self._ctx)
 
         node_reports = [
@@ -964,22 +1087,35 @@ class Pipeline:
         # ── Worker 线程 ───────────────────────────────────────────────
         worker_threads: list[threading.Thread] = []
         for i, nd in enumerate(nodes):
-            if nd.concurrency_type == "process":
-                worker_threads.append(threading.Thread(
-                    target=self._make_process_coordinator(
-                        nd.fn, nd.name, nd.is_generator, nd.workers,
-                        q_in[i], q_out[i], node_reports[i], rc,
-                    ),
-                    daemon=True, name=f"rivus-proc-{nd.name}",
-                ))
-            else:
-                fn = self._make_thread_worker(
-                    nd.fn, nd.name, nd.is_generator,
-                    q_in[i], q_out[i], node_reports[i], rc,
+            if nd.once and i in self._once_executed:
+                # once 节点已在前次 run() 执行过，直接透传 item
+                t = self._make_relay(
+                    q_in[i], q_out[i],
+                    expect=nd.workers, forward=nd.workers,
+                    stop_event=rc.stop_event,
+                    label=f"{self.name}/{nd.name}/once-skip",
                 )
-                for _ in range(nd.workers):
+                worker_threads.append(t)
+            else:
+                if nd.once:
+                    # 首次执行，标记为已完成；下次 run() 将透传
+                    self._once_executed.add(i)
+                if nd.concurrency_type == "process":
                     worker_threads.append(threading.Thread(
-                        target=fn, daemon=True, name=f"rivus-{nd.name}"))
+                        target=self._make_process_coordinator(
+                            nd.fn, nd.name, nd.is_generator, nd.workers,
+                            q_in[i], q_out[i], node_reports[i], rc,
+                        ),
+                        daemon=True, name=f"rivus-proc-{nd.name}",
+                    ))
+                else:
+                    fn = self._make_thread_worker(
+                        nd.fn, nd.name, nd.is_generator,
+                        q_in[i], q_out[i], node_reports[i], rc,
+                    )
+                    for _ in range(nd.workers):
+                        worker_threads.append(threading.Thread(
+                            target=fn, daemon=True, name=f"rivus-{nd.name}"))
 
         # ── 启动 ──────────────────────────────────────────────────────
         collector = self._make_collector(q_results, node_reports, rc)

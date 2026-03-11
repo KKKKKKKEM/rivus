@@ -26,6 +26,7 @@ from rivus.context import Context
 from rivus.exceptions import (
     ContextKeyError,
     NodeError,
+    NodeSkip,
     PipelineError,
     PipelineStop,
     PipelineTimeoutError,
@@ -53,6 +54,7 @@ __all__ = [
     # exceptions
     "RivusError",
     "NodeError",
+    "NodeSkip",
     "PipelineError",
     "PipelineStop",
     "PipelineTimeoutError",

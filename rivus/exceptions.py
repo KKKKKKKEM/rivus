@@ -44,6 +44,28 @@ class PipelineStop(RivusError):
         super().__init__(message)
 
 
+class NodeSkip(RivusError):
+    """节点内主动丢弃当前 item 的信号（不视为错误）。
+
+    节点内 ``raise NodeSkip()`` 时，当前 item **不会**流转到下游节点，
+    也不会出现在最终的 ``report.results`` 中。
+    ``report.nodes[i].items_skipped`` 会累计跳过数量。
+
+    Examples::
+
+        @rivus.node
+        def filter_node(ctx: rivus.Context):
+            item = ctx.require("input")
+            if not is_valid(item):
+                raise rivus.NodeSkip(f"invalid item: {item!r}")
+            return process(item)
+    """
+
+    def __init__(self, message: str = "item skipped") -> None:
+        self.message = message
+        super().__init__(message)
+
+
 class ContextKeyError(RivusError):
     """访问 Context 中不存在的必选键。"""
 

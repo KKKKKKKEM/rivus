@@ -17,7 +17,10 @@
 - [初始化模式](#初始化模式)
   - [共享模型/配置](#共享模型配置)
   - [per-worker 初始化（BaseNode.setup）](#per-worker-初始化basenodesetup)
+  - [Once 节点（生命周期内只执行一次）](#once-节点生命周期内只执行一次)
+  - [Pipeline 生命周期钩子](#pipeline-生命周期钩子)
 - [流控模式](#流控模式)
+  - [NodeSkip：过滤/丢弃 item](#nodeskip过滤丢弃-item)
   - [背压控制（queue_size）](#背压控制queue_size)
   - [优雅停止](#优雅停止)
   - [超时保护](#超时保护)
@@ -264,9 +267,116 @@ report = pipeline.run(*items, initial={"model_path": "/models/v2.pt"})
 
 > **注意**：多 worker 并发调用 `process()` 时，若 `self.model` 非线程安全，需加锁或为每个 worker 创建独立模型实例（在 setup 中初始化 `self._lock = threading.Lock()`）。
 
+### Once 节点（生命周期内只执行一次）
+
+`once=True` 让节点在整个 **Pipeline 对象生命周期**内只执行一次。首次 `run()` 正常执行，后续 `run()` 直接透传 item。
+
+适合：模型加载、数据库连接建立、配置文件读取等**幂等且昂贵**的初始化操作。
+
+```python
+import rivus
+
+@rivus.node(once=True)
+def load_model(ctx: rivus.Context):
+    ctx.log.info("加载模型（整个 Pipeline 生命周期只执行一次）")
+    ctx.set("model", Model.load(ctx.require("model_path")))
+    return ctx.get("input")   # pass-through，让 input 继续流转
+
+@rivus.node(workers=4)
+def infer(ctx: rivus.Context):
+    model = ctx.require("model")
+    return model.predict(ctx.require("input"))
+
+pipeline = rivus.Pipeline("ml") | load_model | infer
+
+report1 = pipeline.run(*batch1, initial={"model_path": "/models/v2.pt"})
+# load_model 已执行，model 存在 ctx 中
+report2 = pipeline.run(*batch2)   # load_model 跳过，直接推理
+```
+
+### Pipeline 生命周期钩子
+
+生命周期钩子让你在 Pipeline 运行的不同阶段插入逻辑，而无需修改任何节点。
+
+| 钩子         | 触发时机                                |
+| ------------ | --------------------------------------- |
+| `on_init`    | 整个生命周期第一次 `run()` 前（仅一次） |
+| `on_start`   | 每次 `run()` / `start()` 开始时         |
+| `on_end`     | 每次运行**成功**后                      |
+| `on_failure` | 每次运行**失败**后                      |
+
+```python
+import rivus
+
+pipeline = rivus.Pipeline("etl") | extract | transform | load
+
+@pipeline.on_init
+def setup_resources(ctx: rivus.Context):
+    ctx.set("db", create_connection_pool())
+    ctx.set("cache", RedisCache())
+
+@pipeline.on_start
+def log_start(ctx: rivus.Context):
+    ctx.log.info("开始新一轮处理")
+
+@pipeline.on_end
+def cleanup(report: rivus.PipelineReport):
+    print(f"完成：{len(report.results)} 条，耗时 {report.total_duration_s:.2f}s")
+
+@pipeline.on_failure
+def alert_on_failure(report: rivus.PipelineReport):
+    for err in report.errors:
+        send_alert(str(err))
+
+# on_init 在首次 run() 前触发
+report1 = pipeline.run(*batch1)
+# on_init 不再触发，on_start/on_end 依然触发
+report2 = pipeline.run(*batch2)
+```
+
 ---
 
 ## 流控模式
+
+### NodeSkip：过滤/丢弃 item
+
+在节点内 `raise NodeSkip()` 可以**静默丢弃当前 item**，不产生错误，item 不会流向下游。
+
+```python
+import rivus
+
+@rivus.node
+def filter_quality(ctx: rivus.Context):
+    item = ctx.require("input")
+    if item.get("quality_score", 0) < 0.7:
+        raise rivus.NodeSkip(f"低质量 item 已过滤: score={item['quality_score']}")
+    return item
+
+@rivus.node(workers=4)
+def process_high_quality(ctx: rivus.Context):
+    # 只有 quality_score >= 0.7 的 item 才会到达这里
+    return enrich(ctx.require("input"))
+
+pipeline = rivus.Pipeline("quality-filter") | filter_quality | process_high_quality
+report = pipeline.run(*raw_items)
+
+# 查看跳过数量
+filter_report = report.nodes[0]
+print(f"过滤掉 {filter_report.items_skipped}/{filter_report.items_in} 条低质量 item")
+```
+
+`NodeSkip` 可以在流水线任意节点使用，不影响其他 item 的处理：
+
+```python
+@rivus.node
+def enrich(ctx: rivus.Context):
+    item = ctx.require("input")
+    try:
+        extra = fetch_extra_info(item["id"])
+    except NotFoundError:
+        raise rivus.NodeSkip(f"id={item['id']} 无额外信息，跳过")
+    return {**item, **extra}
+```
 
 ### 背压控制（queue_size）
 
@@ -577,13 +687,13 @@ print(f"索引完成，共 {report.results[0]} 个 chunk")
 
 ## 性能调优建议
 
-| 场景 | 建议 |
-|------|------|
-| I/O 密集型（HTTP/DB） | `workers=16~64`，`concurrency_type="thread"` |
-| CPU 密集型（图像/数值） | `workers=CPU核数`，`concurrency_type="process"` |
-| 下游明显慢于上游 | 给慢速节点设置 `queue_size`，防止内存溢出 |
-| 需要保持顺序 | `Pipeline(ordered=True)`（有轻微开销） |
-| 允许部分失败 | `fail_fast=False` |
-| 需要全量结果才能继续 | 下游节点加 `gather=True` |
-| 长时间任务 | 设置 `timeout`，或节点内轮询 `ctx.stop_requested` |
-| 节点间数据量大 | 考虑传递数据引用（如文件路径）而非数据本身 |
+| 场景                    | 建议                                              |
+| ----------------------- | ------------------------------------------------- |
+| I/O 密集型（HTTP/DB）   | `workers=16~64`，`concurrency_type="thread"`      |
+| CPU 密集型（图像/数值） | `workers=CPU核数`，`concurrency_type="process"`   |
+| 下游明显慢于上游        | 给慢速节点设置 `queue_size`，防止内存溢出         |
+| 需要保持顺序            | `Pipeline(ordered=True)`（有轻微开销）            |
+| 允许部分失败            | `fail_fast=False`                                 |
+| 需要全量结果才能继续    | 下游节点加 `gather=True`                          |
+| 长时间任务              | 设置 `timeout`，或节点内轮询 `ctx.stop_requested` |
+| 节点间数据量大          | 考虑传递数据引用（如文件路径）而非数据本身        |

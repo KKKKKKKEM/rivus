@@ -32,13 +32,13 @@ Pipeline(
 )
 ```
 
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `name` | `str` | `"pipeline"` | 流水线名称，用于日志标识 |
-| `context` | `Context` \| `None` | `None` | 预初始化的 root Context；不传时自动创建 |
-| `log_config` | `LogConfig` \| `RivusLogger` \| `None` | `None` | 日志配置或日志器实例 |
-| `fail_fast` | `bool` | `True` | 任意节点出错时立即停止整条流水线 |
-| `ordered` | `bool` | `False` | 结果按 item 提交顺序排列（有轻微额外开销） |
+| 参数         | 类型                                   | 默认值       | 说明                                       |
+| ------------ | -------------------------------------- | ------------ | ------------------------------------------ |
+| `name`       | `str`                                  | `"pipeline"` | 流水线名称，用于日志标识                   |
+| `context`    | `Context` \| `None`                    | `None`       | 预初始化的 root Context；不传时自动创建    |
+| `log_config` | `LogConfig` \| `RivusLogger` \| `None` | `None`       | 日志配置或日志器实例                       |
+| `fail_fast`  | `bool`                                 | `True`       | 任意节点出错时立即停止整条流水线           |
+| `ordered`    | `bool`                                 | `False`      | 结果按 item 提交顺序排列（有轻微额外开销） |
 
 ### 示例
 
@@ -98,11 +98,58 @@ p = rivus.Pipeline("demo") | node_a | node_b | NodeC()
 
 ---
 
+## 生命周期钩子
+
+Pipeline 提供四个钩子，可用作装饰器或直接调用注册。
+
+| 方法             | 触发时机                                                          | 函数签名                     |
+| ---------------- | ----------------------------------------------------------------- | ---------------------------- |
+| `on_init(fn)`    | **首次** `run()` / `start()` 唤坂，整个 Pipeline 生命周期内仅一次 | `fn(ctx: Context)`           |
+| `on_start(fn)`   | 每次 `run()` / `start()` 开始时                                   | `fn(ctx: Context)`           |
+| `on_end(fn)`     | 每次运行**成功结束**后                                            | `fn(report: PipelineReport)` |
+| `on_failure(fn)` | 每次运行**失败**后                                                | `fn(report: PipelineReport)` |
+
+**触发顺序**：`on_init`（首次）→ `on_start`（每次）→ [Pipeline 执行] → `on_end` 或 `on_failure`
+
+### 用法示例
+
+```python
+pipeline = rivus.Pipeline("ml-pipeline") | load_model | process | aggregate
+
+@pipeline.on_init
+def setup(ctx: rivus.Context):
+    # 首次运行前执行，适合连接数据库、加载配置等
+    ctx.set("db", create_db_pool())
+    ctx.log.info("初始化完成")
+
+@pipeline.on_start
+def on_start(ctx: rivus.Context):
+    ctx.log.info("开始新一轮运行")
+
+@pipeline.on_end
+def on_end(report: rivus.PipelineReport):
+    print(f"运行成功，耗时 {report.total_duration_s:.2f}s，共 {len(report.results)} 条结果")
+
+@pipeline.on_failure
+def on_failure(report: rivus.PipelineReport):
+    for err in report.errors:
+        send_alert(str(err))
+
+# on_init 钩子在此处触发
+report1 = pipeline.run(*batch1)
+# on_init 不再触发，on_start 依然触发
+report2 = pipeline.run(*batch2)
+```
+
+> 钩子内抛出的异常不会打断 Pipeline 运行，会被记录为警告日志。
+
+---
+
 ## 运行模式
 
 ### 批量运行（最常用）
 
-#### `run(*items, initial=None, timeout=None) → PipelineReport`
+#### `run(*items, initial=None, timeout=None, repeat=1) → PipelineReport | list[PipelineReport]`
 
 同步批量运行，阻塞直到所有 item 处理完毕。
 
@@ -114,17 +161,25 @@ report = pipeline.run(*items, initial={"model": model, "config": cfg})
 
 # 设置超时（秒）
 report = pipeline.run(*items, timeout=30.0)
+
+# 重复运行 5 次（适合定时任务、压测等场景）
+reports = pipeline.run(*items, repeat=5)
+for i, r in enumerate(reports):
+    print(f"第 {i+1} 次：{r.total_duration_s:.2f}s，{len(r.results)} 条")
 ```
 
-| 参数 | 类型 | 说明 |
-|------|------|------|
-| `*items` | `Any` | 待处理的 item，每个自动包装为 `root_ctx.derive(input=item)`；若 item 本身是 `Context` 则直接使用；**不传 item 时自动投递一个 `root_ctx.derive()`** |
-| `initial` | `dict` \| `None` | 运行前写入 root Context 的数据 |
-| `timeout` | `float` \| `None` | 最长执行时间（秒），超时抛出 `PipelineTimeoutError` |
+| 参数      | 类型              | 说明                                                                                                                                               |
+| --------- | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `*items`  | `Any`             | 待处理的 item，每个自动包装为 `root_ctx.derive(input=item)`；若 item 本身是 `Context` 则直接使用；**不传 item 时自动投递一个 `root_ctx.derive()`** |
+| `initial` | `dict` \| `None`  | 运行前写入 root Context 的数据                                                                                                                     |
+| `timeout` | `float` \| `None` | 最长执行时间（秒），超时抛出 `PipelineTimeoutError`                                                                                                |
+| `repeat`  | `int`             | 重复运行次数，默认 `1`；`>1` 时依次运行并返回 `list[PipelineReport]`                                                                               |
 
-**返回**：`PipelineReport`
+**返回**：`repeat=1` 时返回 `PipelineReport`；`repeat>1` 时返回 `list[PipelineReport]`
 
 **注意**：`run()` 使用 `*items` varargs，传入一个列表 `run([a, b, c])` 会将该列表视为**单个 item**。请使用 `run(*my_list)` 展开列表。
+
+**`repeat` 模式的钩子行为**：每次重复都会触发 `on_start` / `on_end` / `on_failure`；`on_init` 仍只在整个 Pipeline 生命周期内触发一次；`once=True` 节点仅首次执行，后续重复直接透传。
 
 ---
 
@@ -220,14 +275,14 @@ report = p.wait()
 
 当前状态，取值见 `PipelineStatus`：
 
-| 状态 | 说明 |
-|------|------|
-| `"idle"` | 未运行 |
-| `"running"` | 正在运行 |
-| `"success"` | 所有 item 成功处理 |
-| `"failed"` | 出现错误（`fail_fast=True` 时触发） |
+| 状态        | 说明                                            |
+| ----------- | ----------------------------------------------- |
+| `"idle"`    | 未运行                                          |
+| `"running"` | 正在运行                                        |
+| `"success"` | 所有 item 成功处理                              |
+| `"failed"`  | 出现错误（`fail_fast=True` 时触发）             |
 | `"stopped"` | 被主动停止（`ctx.stop()` 或 `pipeline.stop()`） |
-| `"timeout"` | 超时 |
+| `"timeout"` | 超时                                            |
 
 ```python
 print(p.status)   # "success"
@@ -287,16 +342,16 @@ class PipelineReport:
 
 ### 属性
 
-| 属性 | 类型 | 说明 |
-|------|------|------|
-| `pipeline_name` | `str` | 流水线名称 |
-| `status` | `str` | 最终状态 |
-| `total_duration_s` | `float` | 总执行时长（秒） |
-| `results` | `list` | 每个 item 的最终 `input` 值 |
-| `contexts` | `list[Context]` | 每个 item 的最终 Context，可访问所有中间数据 |
-| `errors` | `list[BaseException]` | 所有节点错误列表 |
-| `nodes` | `list[NodeReport]` | 每个节点的运行统计 |
-| `succeeded` | `bool`（属性） | `status == "success"` |
+| 属性               | 类型                  | 说明                                         |
+| ------------------ | --------------------- | -------------------------------------------- |
+| `pipeline_name`    | `str`                 | 流水线名称                                   |
+| `status`           | `str`                 | 最终状态                                     |
+| `total_duration_s` | `float`               | 总执行时长（秒）                             |
+| `results`          | `list`                | 每个 item 的最终 `input` 值                  |
+| `contexts`         | `list[Context]`       | 每个 item 的最终 Context，可访问所有中间数据 |
+| `errors`           | `list[BaseException]` | 所有节点错误列表                             |
+| `nodes`            | `list[NodeReport]`    | 每个节点的运行统计                           |
+| `succeeded`        | `bool`（属性）        | `status == "success"`                        |
 
 ### 方法
 
@@ -344,6 +399,7 @@ class NodeReport:
     concurrency_type: str        # "thread" 或 "process"
     items_in: int                # 处理的 item 数量
     items_out: int               # 产出的 item 数量（fan-out 时可能大于 items_in）
+    items_skipped: int           # 节点内 raise NodeSkip() 跳过的 item 数量
     errors: int                  # 发生错误的 item 数量
     total_time_s: float          # 所有 item 处理总耗时
 
@@ -401,6 +457,7 @@ report = p.run(3, 1, 2)   # 即使 1 先处理完，结果也是 [result_3, resu
 ### `fail_fast=True`（默认）
 
 任意节点抛出异常时：
+
 1. 设置 stop 信号，停止接受新 item
 2. 正在处理的 item 完成后 worker 退出
 3. 报告状态为 `FAILED`，`PipelineError` 被抛出

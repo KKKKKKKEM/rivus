@@ -2,10 +2,10 @@
 
 节点（Node）是流水线的最小处理单元。Rivus 提供三种定义节点的方式：
 
-| 方式 | 适用场景 |
-|------|----------|
-| `@node` 装饰器 | 函数式，最简洁 |
-| `Node(fn, ...)` | 直接构造，适合组合/动态创建 |
+| 方式            | 适用场景                            |
+| --------------- | ----------------------------------- |
+| `@node` 装饰器  | 函数式，最简洁                      |
+| `Node(fn, ...)` | 直接构造，适合组合/动态创建         |
 | 继承 `BaseNode` | 类式，需要 `setup` 初始化或持有状态 |
 
 **源码**：`rivus/node.py`
@@ -23,12 +23,21 @@ def fn(ctx: Context) -> Any
 - **输入**：只接受一个 `ctx: Context` 参数
 - **输出**约定见下表：
 
-| 返回值类型 | 框架行为 |
-|-----------|---------|
-| 普通值（包括 `dict`, `str`, `int` 等） | 框架以 `ctx.derive(input=value)` 包装后传下游 |
-| `None` | 当前 ctx 原样传下游（pass-through / 副作用节点） |
-| `Context` 实例 | 直接传下游（用户手动控制派生） |
-| `yield` 多个值 | 每个 yield 产生一个独立的下游 item（fan-out，一进多出） |
+| 返回值类型                             | 框架行为                                                |
+| -------------------------------------- | ------------------------------------------------------- |
+| 普通值（包括 `dict`, `str`, `int` 等） | 框架以 `ctx.derive(input=value)` 包装后传下游           |
+| `None`                                 | 当前 ctx 原样传下游（pass-through / 副作用节点）        |
+| `Context` 实例                         | 直接传下游（用户手动控制派生）                          |
+| `yield` 多个值                         | 每个 yield 产生一个独立的下游 item（fan-out，一进多出） |
+
+### 节点内信号
+
+除返回值外，节点还可以通过抛出信号来控制流程：
+
+| 信号                                  | 行为                                    |
+| ------------------------------------- | --------------------------------------- |
+| `raise NodeSkip()`                    | 静默丢弃当前 item，不传下游，不记为错误 |
+| `ctx.stop()` / `raise PipelineStop()` | 整条 Pipeline 优雅停止                  |
 
 ---
 
@@ -58,17 +67,19 @@ def inference(ctx: Context):
     setup: Callable[[Context], None] | None = None,
     concurrency_type: str = "thread",
     gather: bool = False,
+    once: bool = False,
 )
 ```
 
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `name` | `str` \| `None` | 函数名 | 节点名称，用于日志和报告 |
-| `workers` | `int` | `1` | 并发 worker 数量；`1` 为串行，`N>1` 为并发 |
-| `queue_size` | `int` | `0` | 输入队列最大容量；`0` 表示无限（不背压） |
-| `setup` | `Callable` \| `None` | `None` | 初始化函数，Pipeline 启动时以 root ctx 调用一次 |
-| `concurrency_type` | `str` | `"thread"` | `"thread"` 或 `"process"`，见[并发模式](#并发模式) |
-| `gather` | `bool` | `False` | 若为 `True`，本节点前插入同步屏障，见[Gather 模式](#gather-模式) |
+| 参数               | 类型                 | 默认值     | 说明                                                                            |
+| ------------------ | -------------------- | ---------- | ------------------------------------------------------------------------------- |
+| `name`             | `str` \| `None`      | 函数名     | 节点名称，用于日志和报告                                                        |
+| `workers`          | `int`                | `1`        | 并发 worker 数量；`1` 为串行，`N>1` 为并发                                      |
+| `queue_size`       | `int`                | `0`        | 输入队列最大容量；`0` 表示无限（不背压）                                        |
+| `setup`            | `Callable` \| `None` | `None`     | 初始化函数，Pipeline 启动时以 root ctx 调用一次                                 |
+| `concurrency_type` | `str`                | `"thread"` | `"thread"` 或 `"process"`，见[并发模式](#并发模式)                              |
+| `gather`           | `bool`               | `False`    | 若为 `True`，本节点前插入同步屏障，见[Gather 模式](#gather-模式)                |
+| `once`             | `bool`               | `False`    | 若为 `True`，该节点在 Pipeline 生命周期内只执行一次，见 [Once 模式](#once-模式) |
 
 ### 用法示例
 
@@ -121,6 +132,27 @@ def reduce(ctx: Context):
     return merge(results)
 ```
 
+**用法六：NodeSkip 信号**
+
+```python
+@node
+def filter_node(ctx: Context):
+    item = ctx.require("input")
+    if not is_valid(item):
+        raise rivus.NodeSkip(f"invalid item: {item!r}")   # 静默丢弃
+    return process(item)
+```
+
+**用法七：once 模式（Pipeline 生命周期内只执行一次）**
+
+```python
+@node(once=True)
+def load_config(ctx: Context):
+    ctx.log.info("加载配置（只执行一次）")
+    ctx.set("config", load_from_disk())
+    return ctx.get("input")   # pass-through
+```
+
 ---
 
 ## `Node` 类
@@ -146,28 +178,30 @@ my_node = Node(
 
 ### 构造参数
 
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `fn` | `Callable[[Context], Any]` | 必填 | 处理函数 |
-| `name` | `str` \| `None` | `None` → 取 `fn.__name__` | 节点名称 |
-| `workers` | `int` | `1` | 并发 worker 数量 |
-| `queue_size` | `int` | `0` | 输入队列容量 |
-| `setup_fn` | `Callable[[Context], None]` \| `None` | `None` | 初始化函数 |
-| `concurrency_type` | `str` | `"thread"` | `"thread"` 或 `"process"` |
-| `gather` | `bool` | `False` | 是否采用 gather 模式 |
+| 参数               | 类型                                  | 默认值                    | 说明                          |
+| ------------------ | ------------------------------------- | ------------------------- | ----------------------------- |
+| `fn`               | `Callable[[Context], Any]`            | 必填                      | 处理函数                      |
+| `name`             | `str` \| `None`                       | `None` → 取 `fn.__name__` | 节点名称                      |
+| `workers`          | `int`                                 | `1`                       | 并发 worker 数量              |
+| `queue_size`       | `int`                                 | `0`                       | 输入队列容量                  |
+| `setup_fn`         | `Callable[[Context], None]` \| `None` | `None`                    | 初始化函数                    |
+| `concurrency_type` | `str`                                 | `"thread"`                | `"thread"` 或 `"process"`     |
+| `gather`           | `bool`                                | `False`                   | 是否采用 gather 模式          |
+| `once`             | `bool`                                | `False`                   | Pipeline 生命周期内只执行一次 |
 
 ### 属性
 
-| 属性 | 类型 | 说明 |
-|------|------|------|
-| `fn` | `Callable` | 处理函数 |
-| `name` | `str` | 节点名称 |
-| `workers` | `int` | 并发度 |
-| `queue_size` | `int` | 队列容量 |
-| `setup_fn` | `Callable` \| `None` | 初始化函数 |
-| `concurrency_type` | `str` | 并发类型 |
-| `gather` | `bool` | gather 模式标志 |
-| `is_generator` | `bool` | 处理函数是否为生成器（框架自动检测） |
+| 属性               | 类型                 | 说明                                 |
+| ------------------ | -------------------- | ------------------------------------ |
+| `fn`               | `Callable`           | 处理函数                             |
+| `name`             | `str`                | 节点名称                             |
+| `workers`          | `int`                | 并发度                               |
+| `queue_size`       | `int`                | 队列容量                             |
+| `setup_fn`         | `Callable` \| `None` | 初始化函数                           |
+| `concurrency_type` | `str`                | 并发类型                             |
+| `gather`           | `bool`               | gather 模式标志                      |
+| `once`             | `bool`               | once 模式标志                        |
+| `is_generator`     | `bool`               | 处理函数是否为生成器（框架自动检测） |
 
 ---
 
@@ -196,13 +230,14 @@ class Preprocess(BaseNode):
 
 ### 类属性
 
-| 属性 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `name` | `str` | `""` → 取类名 | 节点名称 |
-| `workers` | `int` | `1` | 并发 worker 数量 |
-| `queue_size` | `int` | `0` | 输入队列容量 |
-| `concurrency_type` | `str` | `"thread"` | 并发类型 |
-| `gather` | `bool` | `False` | 是否采用 gather 模式 |
+| 属性               | 类型   | 默认值        | 说明                          |
+| ------------------ | ------ | ------------- | ----------------------------- |
+| `name`             | `str`  | `""` → 取类名 | 节点名称                      |
+| `workers`          | `int`  | `1`           | 并发 worker 数量              |
+| `queue_size`       | `int`  | `0`           | 输入队列容量                  |
+| `concurrency_type` | `str`  | `"thread"`    | 并发类型                      |
+| `gather`           | `bool` | `False`       | 是否采用 gather 模式          |
+| `once`             | `bool` | `False`       | Pipeline 生命周期内只执行一次 |
 
 ### 方法
 
@@ -247,6 +282,99 @@ class Aggregate(BaseNode):
     def process(self, ctx: Context):
         chunks = ctx.require("input")   # list
         return "\n".join(chunks)
+```
+
+### 支持 once 模式
+
+```python
+class InitDB(BaseNode):
+    once = True   # 整个 Pipeline 生命周期内只执行一次
+
+    def process(self, ctx: Context):
+        ctx.set("db", create_connection())
+        return ctx.get("input")   # pass-through
+```
+
+---
+
+## Once 模式
+
+给节点设置 `once=True` 后，该节点在整个 **Pipeline 对象生命周期**内只执行一次：
+
+- **首次 `run()`**：正常执行节点函数
+- **后续 `run()`**：节点被跳过，item 直接透传到下游
+
+```
+第一次 run()：item → [load_config（执行）] → item → 下游
+第二次 run()：item → [load_config（跳过）] → item → 下游
+```
+
+**适用场景**：模型加载、数据库连接建立、配置文件读取等幂等初始化操作。
+
+```python
+@node(once=True)
+def load_model(ctx: Context):
+    ctx.set("model", Model.load(ctx.require("model_path")))
+    return ctx.get("input")   # pass-through，让 input 继续流转
+
+@node(workers=4)
+def infer(ctx: Context):
+    model = ctx.require("model")
+    return model.predict(ctx.require("input"))
+
+pipeline = Pipeline("ml") | load_model | infer
+
+# 第一次：load_model 执行，加载模型
+report1 = pipeline.run(*batch1)
+# 第二次：load_model 跳过，模型已在 ctx 中
+report2 = pipeline.run(*batch2)
+```
+
+> **注意**：`once` 节点透传时不修改 item，`ctx.require("input")` 在下游依然可用。
+
+---
+
+## NodeSkip 信号
+
+在节点函数中 `raise NodeSkip()` 可以**静默丢弃当前 item**：
+
+- 当前 item **不会**流转到下游任何节点
+- 不记为错误（`nr.errors` 不变）
+- `nr.items_skipped` 计数 +1
+- 最终 `report.results` 中不包含该 item
+
+```python
+from rivus import node, NodeSkip, Context
+
+@node
+def filter_node(ctx: Context):
+    item = ctx.require("input")
+    if item.get("score", 0) < 0.5:
+        raise NodeSkip(f"low score: {item['score']}")
+    return item
+
+@node
+def process(ctx: Context):
+    # 只有 score >= 0.5 的 item 才会到达这里
+    return transform(ctx.require("input"))
+
+pipeline = Pipeline("filter-pipeline") | filter_node | process
+report = pipeline.run(*items)
+
+# 查看跳过数量
+for nr in report.nodes:
+    print(f"{nr.name}: in={nr.items_in} out={nr.items_out} skipped={nr.items_skipped}")
+```
+
+`NodeSkip` 也可以在 `BaseNode` 中使用：
+
+```python
+class FilterNode(BaseNode):
+    def process(self, ctx: Context):
+        item = ctx.require("input")
+        if not validate(item):
+            raise NodeSkip("validation failed")
+        return item
 ```
 
 ---
@@ -296,6 +424,7 @@ def fetch(ctx: Context):
 使用 `concurrent.futures.ProcessPoolExecutor` + 单协调线程实现并发，适合 **CPU 密集型**任务（图像处理、数值计算、模型推理等）。
 
 **限制**：
+
 - 节点函数 `fn` 必须可 pickle（模块级函数或可 pickle 的可调用对象）
 - `Context` 以 `dict` 形式序列化传递（自动处理）
 - `setup_fn` 在主进程运行，不会传入子进程
