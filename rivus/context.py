@@ -140,7 +140,7 @@ class Context:
 
             @node
             def my_node(ctx: Context):
-                model = ctx.pipeline.get_var("model")
+                model = ctx.pipeline.get("model")
                 return model(ctx.require("input"))
         """
         return getattr(self, "_pipeline_ref", None)

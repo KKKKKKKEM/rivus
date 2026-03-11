@@ -374,7 +374,7 @@ class Pipeline:
     # 全局变量 API
     # ------------------------------------------------------------------
 
-    def set_var(self, key: str, value: Any) -> None:
+    def set(self, key: str, value: Any) -> None:
         """设置 Pipeline 级全局变量（线程安全）。
 
         适合存储 Pipeline 实例化后即创建、需在所有节点间复用的对象，
@@ -387,12 +387,12 @@ class Pipeline:
         Examples::
 
             pipeline = Pipeline("infer")
-            pipeline.set_var("model", load_model())
+            pipeline.set("model", load_model())
         """
         with self._vars_lock:
             self._vars[key] = value
 
-    def get_var(self, key: str, default: Any = None) -> Any:
+    def get(self, key: str, default: Any = None) -> Any:
         """获取 Pipeline 级全局变量（线程安全）。
 
         Args:
@@ -406,7 +406,7 @@ class Pipeline:
 
             @node(workers=4)
             def infer(ctx: Context):
-                model = ctx.pipeline.get_var("model")
+                model = ctx.pipeline.get("model")
                 return model(ctx.require("input"))
         """
         with self._vars_lock:
