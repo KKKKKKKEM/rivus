@@ -1,3 +1,4 @@
-.vscode/launch.json
+.vscode/
 *.pyc
 __pycache__/
+dist/

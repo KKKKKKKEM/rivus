@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import inspect
 import queue
+import random
 import threading
 import time
 from dataclasses import dataclass, field
@@ -106,11 +107,8 @@ class NodeReport:
     min_time_s: float = float("inf")
     max_time_s: float = 0.0
     _times: list = field(default_factory=list, repr=False, compare=False)
-
-    def __post_init__(self) -> None:
-        # 兼容显式传参时 _times 未初始化的情况
-        if not hasattr(self, "_times"):
-            object.__setattr__(self, "_times", [])
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False)
 
     @property
     def avg_time_s(self) -> float:
@@ -134,9 +132,16 @@ class NodeReport:
         return s[int(len(s) * 0.95)]
 
     def _update_timing(self, elapsed: float) -> None:
-        """更新耗时统计（NOT thread-safe，需在锁内调用）。"""
+        """更新耗时统计（须在 _lock 内调用）。使用蓄水池采样，最多保留 10000 个样本。"""
         self.total_time_s += elapsed
-        self._times.append(elapsed)
+        n = len(self._times)
+        if n < 10_000:
+            self._times.append(elapsed)
+        else:
+            # 蓄水池采样：以 10000/items_out 的概率替换随机位置
+            idx = random.randint(0, self.items_out - 1)
+            if idx < 10_000:
+                self._times[idx] = elapsed
         if elapsed < self.min_time_s:
             self.min_time_s = elapsed
         if elapsed > self.max_time_s:
@@ -310,6 +315,9 @@ class Pipeline:
         log_config: 日志配置。
         fail_fast: 任意节点出错立即停止（默认 True）。
         ordered: 结果按提交顺序排列（有轻微额外开销）。
+        keep_contexts: 是否在报告中保留所有最终 Context 对象（大批量 item 时
+            建议保持默认 ``False`` 以降低内存占用）。
+        timeout_grace: 超时触发后等待 collector 完成的宽限时间（秒，默认 5.0）。
     """
 
     def __init__(
@@ -320,10 +328,14 @@ class Pipeline:
         log_config: LogConfig | RivusLogger | None = None,
         fail_fast: bool = True,
         ordered: bool = False,
+        keep_contexts: bool = False,
+        timeout_grace: float = 5.0,
     ) -> None:
         self.name = name
         self.fail_fast = fail_fast
         self.ordered = ordered
+        self.keep_contexts = keep_contexts
+        self.timeout_grace = timeout_grace
         self._nodes: list[Node] = []
 
         if isinstance(log_config, RivusLogger):
@@ -391,6 +403,15 @@ class Pipeline:
         """
         with self._vars_lock:
             self._vars[key] = value
+
+    from typing import TypeVar as _TV
+    from typing import overload as _overload
+    _T = _TV("_T")
+
+    @_overload
+    def get(self, key: str) -> Any: ...
+    @_overload
+    def get(self, key: str, default: "_T") -> "_T": ...
 
     def get(self, key: str, default: Any = None) -> Any:
         """获取 Pipeline 级全局变量（线程安全）。
@@ -720,7 +741,7 @@ class Pipeline:
             done_count = 0
             while True:
                 try:
-                    item = in_q.get(timeout=0.05)
+                    item = in_q.get(timeout=0.1)
                 except queue.Empty:
                     if stop_event.is_set():
                         for _ in range(forward):
@@ -733,8 +754,9 @@ class Pipeline:
                         for _ in range(forward):
                             out_q.put(_DONE)
                         return
-                else:
+                elif not stop_event.is_set():
                     out_q.put(item)
+                # stop_event 已设置：丢弃 item，避免向有界队列写满导致死锁
 
         return threading.Thread(target=_relay, daemon=True, name=f"rivus-relay-{label}")
 
@@ -761,7 +783,7 @@ class Pipeline:
             done_count = 0
             while True:
                 try:
-                    item = in_q.get(timeout=0.05)
+                    item = in_q.get(timeout=0.1)
                 except queue.Empty:
                     if stop_event.is_set():
                         for _ in range(forward):
@@ -777,11 +799,12 @@ class Pipeline:
                         for _ in range(forward):
                             out_q.put(_DONE)
                         return
-                else:
+                elif not stop_event.is_set():
                     ctx_item = item[1] if ordered else item
                     if base_ctx is None:
                         base_ctx = ctx_item
                     collected.append(ctx_item.get("input"))
+                # stop_event 已设置：丢弃 item
 
         return threading.Thread(target=_relay, daemon=True, name=f"rivus-gather-{label}")
 
@@ -828,7 +851,7 @@ class Pipeline:
 
                 seq, item_ctx = tagged if rc.ordered else (None, tagged)
 
-                with rc.errors_lock:
+                with nr._lock:
                     nr.items_in += 1
 
                 _t0 = time.perf_counter()
@@ -843,31 +866,31 @@ class Pipeline:
                             out_q.put((rc.new_seq(), out_ctx)
                                       if rc.ordered else out_ctx)
                             _count += 1
-                        with rc.errors_lock:
+                        with nr._lock:
                             nr.items_out += _count
                             nr._update_timing(time.perf_counter() - _t0)
 
                     elif result is None:
                         out_q.put((seq, item_ctx) if rc.ordered else item_ctx)
-                        with rc.errors_lock:
+                        with nr._lock:
                             nr.items_out += 1
                             nr._update_timing(time.perf_counter() - _t0)
 
                     elif isinstance(result, Context):
                         out_q.put((seq, result) if rc.ordered else result)
-                        with rc.errors_lock:
+                        with nr._lock:
                             nr.items_out += 1
                             nr._update_timing(time.perf_counter() - _t0)
 
                     else:
                         out_ctx = item_ctx.derive(input=result)
                         out_q.put((seq, out_ctx) if rc.ordered else out_ctx)
-                        with rc.errors_lock:
+                        with nr._lock:
                             nr.items_out += 1
                             nr._update_timing(time.perf_counter() - _t0)
 
                 except NodeSkip as skip_exc:
-                    with rc.errors_lock:
+                    with nr._lock:
                         nr.items_skipped += 1
                     rc.root_ctx.log.debug(
                         "Pipeline '%s' node '%s' skipped item: %s",
@@ -884,9 +907,10 @@ class Pipeline:
                     return
 
                 except Exception as exc:
-                    with rc.errors_lock:
+                    with nr._lock:
                         nr.errors += 1
                         nr._update_timing(time.perf_counter() - _t0)
+                    with rc.errors_lock:
                         rc.errors.append(NodeError(nname, exc))
                     if rc.fail_fast:
                         rc.stop_event.set()
@@ -921,10 +945,10 @@ class Pipeline:
                         seq, item_ctx = pending.pop(future)
                         try:
                             res_type, res_data, elapsed = future.result()
-                            with rc.errors_lock:
+                            with nr._lock:
                                 nr._update_timing(elapsed)
                             if res_type == "skip":
-                                with rc.errors_lock:
+                                with nr._lock:
                                     nr.items_skipped += 1
                                 rc.root_ctx.log.debug(
                                     "Pipeline '%s' node '%s' skipped item: %s",
@@ -939,7 +963,7 @@ class Pipeline:
                                     )
                                     out_q.put((rc.new_seq(), out_ctx)
                                               if rc.ordered else out_ctx)
-                                    with rc.errors_lock:
+                                    with nr._lock:
                                         nr.items_out += 1
                             else:
                                 out_ctx = (
@@ -949,11 +973,12 @@ class Pipeline:
                                 )
                                 out_q.put((seq, out_ctx)
                                           if rc.ordered else out_ctx)
-                                with rc.errors_lock:
+                                with nr._lock:
                                     nr.items_out += 1
                         except Exception as exc:
-                            with rc.errors_lock:
+                            with nr._lock:
                                 nr.errors += 1
+                            with rc.errors_lock:
                                 rc.errors.append(NodeError(nname, exc))
                             if rc.fail_fast:
                                 rc.stop_event.set()
@@ -983,10 +1008,10 @@ class Pipeline:
                         continue
 
                     seq, item_ctx = tagged if rc.ordered else (None, tagged)
-                    with rc.errors_lock:
+                    with nr._lock:
                         nr.items_in += 1
-                    pending[executor.submit(_mp_run, fn, dict(
-                        item_ctx._data), is_gen)] = (seq, item_ctx)
+                    pending[executor.submit(_mp_run, fn, item_ctx.snapshot(), is_gen)] = (
+                        seq, item_ctx)
 
             # relay 期望收到 n_workers 个 _DONE
             for _ in range(n_workers):
@@ -1036,7 +1061,7 @@ class Pipeline:
                 status=final_status,
                 total_duration_s=total_duration,
                 results=[c.get("input") for c in final_ctxs],
-                contexts=final_ctxs,
+                contexts=final_ctxs if self.keep_contexts else [],
                 errors=list(rc.errors),
                 nodes=node_reports,
             )
@@ -1214,7 +1239,7 @@ class Pipeline:
 
         if th.is_alive():
             self._stop_event.set()
-            self._done_event.wait(timeout=2.0)
+            self._done_event.wait(timeout=self.timeout_grace)
             with self._state_lock:
                 if self._status == PipelineStatus.RUNNING:
                     self._status = PipelineStatus.TIMEOUT
@@ -1226,7 +1251,7 @@ class Pipeline:
             )
             raise exc
 
-        self._done_event.wait(timeout=2.0)
+        self._done_event.wait(timeout=self.timeout_grace)
         if self._exc is not None:
             raise self._exc
         return self._report  # type: ignore[return-value]

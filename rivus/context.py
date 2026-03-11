@@ -5,10 +5,12 @@ from __future__ import annotations
 import copy
 import threading
 from threading import RLock
-from typing import Any, Iterator
+from typing import Any, Iterator, TypeVar, overload
 
 from rivus.exceptions import ContextKeyError, PipelineStop
 from rivus.log import RivusLogger, default_logger
+
+T = TypeVar("T")
 
 
 class Context:
@@ -34,6 +36,11 @@ class Context:
     # ------------------------------------------------------------------
     # 读操作
     # ------------------------------------------------------------------
+
+    @overload
+    def get(self, key: str) -> Any: ...
+    @overload
+    def get(self, key: str, default: T) -> T: ...
 
     def get(self, key: str, default: Any = None) -> Any:
         """获取键对应的值，键不存在时返回 *default*。"""
