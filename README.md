@@ -19,7 +19,7 @@ items → wrap(ctx) → Q → [Node A, workers=W] → Q → [Node B, workers=W] 
 ## 安装
 
 ```bash
-pip install rivus
+pip install -U git+https://github.com/KKKKKKKEM/rivus.git
 ```
 
 ## 快速上手
