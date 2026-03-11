@@ -126,6 +126,25 @@ class Context:
         """由 Pipeline 内部调用，将配置好的日志器绑定到此 Context。"""
         self._logger = logger
 
+    def _attach_pipeline(self, pipeline: Any) -> None:
+        """由 Pipeline 内部调用，将自身引用绑定到此 Context。"""
+        self._pipeline_ref = pipeline
+
+    @property
+    def pipeline(self) -> Any:
+        """返回当前 Context 所属的 Pipeline 实例。
+
+        若在 Pipeline 外独立使用 Context，则返回 ``None``。
+
+        Examples::
+
+            @node
+            def my_node(ctx: Context):
+                model = ctx.pipeline.get_var("model")
+                return model(ctx.require("input"))
+        """
+        return getattr(self, "_pipeline_ref", None)
+
     def _attach_stop_event(self, event: threading.Event) -> None:
         """由 Pipeline 内部调用，注入停止信号事件。"""
         self._stop_event_ref: threading.Event = event
@@ -196,6 +215,9 @@ class Context:
         ev = getattr(self, "_stop_event_ref", None)
         if ev is not None:
             child._attach_stop_event(ev)
+        pl = getattr(self, "_pipeline_ref", None)
+        if pl is not None:
+            child._attach_pipeline(pl)
         if kwargs:
             child.update(kwargs)
         return child

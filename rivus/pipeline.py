@@ -364,6 +364,53 @@ class Pipeline:
         self._hooks_failure: list[Callable] = []
 
         self._ctx._attach_stop_event(self._stop_event)
+        self._ctx._attach_pipeline(self)
+
+        # 全局变量存储（Pipeline 生命周期内跨 item 共享）
+        self._vars: dict[str, Any] = {}
+        self._vars_lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # 全局变量 API
+    # ------------------------------------------------------------------
+
+    def set_var(self, key: str, value: Any) -> None:
+        """设置 Pipeline 级全局变量（线程安全）。
+
+        适合存储 Pipeline 实例化后即创建、需在所有节点间复用的对象，
+        如模型、数据库连接、共享配置等。
+
+        Args:
+            key:   变量名。
+            value: 任意值。
+
+        Examples::
+
+            pipeline = Pipeline("infer")
+            pipeline.set_var("model", load_model())
+        """
+        with self._vars_lock:
+            self._vars[key] = value
+
+    def get_var(self, key: str, default: Any = None) -> Any:
+        """获取 Pipeline 级全局变量（线程安全）。
+
+        Args:
+            key:     变量名。
+            default: 键不存在时的默认值，默认为 ``None``。
+
+        Returns:
+            对应变量值，或 *default*。
+
+        Examples::
+
+            @node(workers=4)
+            def infer(ctx: Context):
+                model = ctx.pipeline.get_var("model")
+                return model(ctx.require("input"))
+        """
+        with self._vars_lock:
+            return self._vars.get(key, default)
 
     # ------------------------------------------------------------------
     # Builder API
@@ -746,6 +793,9 @@ class Pipeline:
         ev = getattr(rc.root_ctx, "_stop_event_ref", None)
         if ev is not None:
             ctx._attach_stop_event(ev)
+        pl = getattr(rc.root_ctx, "_pipeline_ref", None)
+        if pl is not None:
+            ctx._attach_pipeline(pl)
         return ctx
 
     def _make_thread_worker(
