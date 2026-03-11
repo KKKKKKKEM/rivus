@@ -705,9 +705,12 @@ class Pipeline:
         """gather relay：收集上游全部 item，合并为单个 list 后传入下游节点。
 
         下游节点收到的 ``ctx.require("input")`` 将是所有上游结果值组成的列表。
+        合并 ctx 以**第一个到达的上游 item ctx** 为基础派生，从而保留上游节点
+        写入 ctx 的所有数据（``ctx.set(...)``）；若无 item 则回退到 root_ctx。
         """
         def _relay() -> None:
             collected: list = []
+            base_ctx: "Context | None" = None
             done_count = 0
             while True:
                 try:
@@ -721,13 +724,16 @@ class Pipeline:
                 if item is _DONE:
                     done_count += 1
                     if done_count >= expect:
-                        merged_ctx = root_ctx.derive(input=collected)
+                        merged_ctx = (base_ctx if base_ctx is not None else root_ctx).derive(
+                            input=collected)
                         out_q.put((0, merged_ctx) if ordered else merged_ctx)
                         for _ in range(forward):
                             out_q.put(_DONE)
                         return
                 else:
                     ctx_item = item[1] if ordered else item
+                    if base_ctx is None:
+                        base_ctx = ctx_item
                     collected.append(ctx_item.get("input"))
 
         return threading.Thread(target=_relay, daemon=True, name=f"rivus-gather-{label}")
