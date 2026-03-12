@@ -24,10 +24,8 @@ items → wrap(ctx) → Q → [Node A, workers=W] → Q → [Node B, workers=W] 
 ### API 参考
 - [Context](api/context.md) — 线程安全状态容器
 - [Node / @node / BaseNode](api/node.md) — 节点定义方式
-- [Pipeline](api/pipeline.md) — 流水线核心类
-- [日志（LogConfig / RivusLogger）](api/log.md) — 日志体系
+- [Pipeline](api/pipeline.md) — 流水线核心类（含 RunStorage）
 - [异常（Exceptions）](api/exceptions.md) — 异常体系
-
 ### 进阶指南
 - [使用模式与最佳实践](guides/patterns.md) — 常用模式、fan-out、gather、进程模式等
 
@@ -63,10 +61,10 @@ from rivus import (
     Node, node, BaseNode,
     # 流水线
     Pipeline, PipelineStatus, PipelineReport, NodeReport,
+    # 存储
+    RunStorage, RunStorageBackend, InMemoryStorage,
     # 上下文
     Context,
-    # 日志
-    LogConfig, RivusLogger,
     # 异常
     RivusError, NodeError, PipelineError,
     PipelineTimeoutError, PipelineStop, ContextKeyError,

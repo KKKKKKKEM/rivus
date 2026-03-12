@@ -15,8 +15,6 @@
         Pipeline, PipelineStatus, PipelineReport, NodeReport,
         # 共享上下文
         Context,
-        # 日志
-        LogConfig, RivusLogger,
         # 异常
         RivusError, NodeError, PipelineError, PipelineTimeoutError, ContextKeyError,
     )
@@ -32,9 +30,16 @@ from rivus.exceptions import (
     PipelineTimeoutError,
     RivusError,
 )
-from rivus.log import LogConfig, RivusLogger
 from rivus.node import BaseNode, Node, node
-from rivus.pipeline import NodeReport, Pipeline, PipelineReport, PipelineStatus
+from rivus.pipeline import (
+    InMemoryStorage,
+    NodeReport,
+    Pipeline,
+    PipelineReport,
+    PipelineStatus,
+    RunStorage,
+    RunStorageBackend,
+)
 
 __all__ = [
     # node
@@ -46,11 +51,12 @@ __all__ = [
     "PipelineStatus",
     "PipelineReport",
     "NodeReport",
+    # storage
+    "RunStorage",
+    "RunStorageBackend",
+    "InMemoryStorage",
     # context
     "Context",
-    # logging
-    "LogConfig",
-    "RivusLogger",
     # exceptions
     "RivusError",
     "NodeError",

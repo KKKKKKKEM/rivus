@@ -15,6 +15,7 @@ items → wrap(ctx) → Q → [Node A, workers=W] → Q → [Node B, workers=W] 
 - **gather 屏障** — `gather=True` 将上游所有输出汇聚后再处理
 - **优雅停止** — 节点内调用 `ctx.stop()` 可安全终止流水线
 - **结构化报告** — 含耗时统计（min/max/avg/p50/p95）的 `PipelineReport`
+- **RunStorage** — 每次 `run()` 自动分配 `run_id`，所有历史运行状态可查可管理
 
 ## 安装
 
@@ -41,7 +42,7 @@ report = (rivus.Pipeline("demo") | parse | process).run("hello", "world")
 print(report.results)
 # ['processed: HELLO', 'processed: WORLD']
 print(report.status)
-# PipelineStatus.COMPLETED
+# 'success'
 ```
 
 ## 核心概念
@@ -56,7 +57,6 @@ def my_node(ctx: rivus.Context):
     item = ctx.require("input")       # 读取当前 item（不存在则抛异常）
     value = ctx.get("key", default)   # 读取共享元数据
     ctx.set("key", value)             # 写入共享元数据
-    ctx.log.info("message")           # 结构化日志
     return result
 ```
 
@@ -130,12 +130,46 @@ def cpu_bound(ctx: rivus.Context):
 | `Pipeline(name)` | 创建流水线 |
 | `Pipeline \| node` | 添加节点 |
 | `Pipeline.run(*items)` | 同步运行，返回 `PipelineReport` |
+| `Pipeline.storage` | `RunStorage` 实例，管理所有历史运行状态 |
 | `Context` | item + 共享元数据容器 |
-| `PipelineReport` | 运行报告（状态、结果、错误、耗时） |
+| `PipelineReport` | 运行报告（含 `run_id`、状态、结果、错误、耗时） |
 | `NodeReport` | 单节点统计（处理数、错误数、耗时分布） |
-| `LogConfig` | 日志配置 |
+| `RunStorage` | 历史运行状态管理接口（`get` / `list` / `clear`） |
+| `RunStorageBackend` | 可插拔存储后端抽象基类 |
+| `InMemoryStorage` | 默认 LRU 内存后端（`max_runs=100`） |
 
 详细文档见 [docs/](docs/)。
+
+## RunStorage — 历史运行管理
+
+每次 `run()` / `run_background()` / `start()` 都会生成唯一的 `run_id`（UUID4），运行状态和报告自动存入 `pipeline.storage`：
+
+```python
+report1 = pipeline.run("hello")
+report2 = pipeline.run("world")
+
+# 每个报告携带唯一 run_id
+print(report1.run_id)   # 'a1b2c3d4-...'
+print(report2.run_id)   # 'e5f6g7h8-...'
+
+# 列出所有历史 run_id（oldest → newest）
+for rid in pipeline.storage.list():
+    state = pipeline.storage.get(rid)
+    print(rid, state.report.status)
+
+# 按 run_id 查询
+state = pipeline.storage[report1.run_id]
+print(state.report.results)
+
+# 自定义存储后端（如 SQLite、Redis）
+class MyBackend(rivus.RunStorageBackend):
+    def save(self, run_id, state): ...
+    def get(self, run_id): ...
+    def list(self): ...
+    def clear(self): ...
+
+pipeline = rivus.Pipeline("demo", storage=MyBackend())
+```
 
 ## 示例
 

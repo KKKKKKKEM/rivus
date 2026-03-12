@@ -254,7 +254,6 @@ class InferenceNode(rivus.BaseNode):
         model_path = ctx.require("model_path")
         self.model = ModelLoader.load(model_path)
         self.threshold = ctx.get("threshold", 0.5)
-        ctx.log.info("Model loaded from %s", model_path)
 
     def process(self, ctx: rivus.Context):
         data = ctx.require("input")
@@ -278,7 +277,6 @@ import rivus
 
 @rivus.node(once=True)
 def load_model(ctx: rivus.Context):
-    ctx.log.info("加载模型（整个 Pipeline 生命周期只执行一次）")
     ctx.set("model", Model.load(ctx.require("model_path")))
     return ctx.get("input")   # pass-through，让 input 继续流转
 
@@ -317,7 +315,7 @@ def setup_resources(ctx: rivus.Context):
 
 @pipeline.on_start
 def log_start(ctx: rivus.Context):
-    ctx.log.info("开始新一轮处理")
+    pass
 
 @pipeline.on_end
 def cleanup(report: rivus.PipelineReport):
@@ -421,7 +419,7 @@ def process_with_early_exit(ctx: rivus.Context):
     results = []
     for chunk in data.chunks():
         if ctx.stop_requested:     # 轮询停止标志
-            ctx.log.info("early exit due to stop request")
+            print("early exit due to stop request")
             break
         results.append(process_chunk(chunk))
     return results
@@ -666,10 +664,7 @@ def build_index(ctx: rivus.Context):
 
 
 pipeline = (
-    rivus.Pipeline(
-        "rag_indexer",
-        log_config=rivus.LogConfig(level="INFO", to_file="rag_build.log"),
-    )
+    rivus.Pipeline("rag_indexer")
     | chunk_document
     | EmbedNode()
     | build_index

@@ -3,7 +3,7 @@
 核心模型
 --------
 队列中流淌的是 **Context 对象**（而非裸 item）。
-每个 Node 持有一个 ``fn(ctx)`` 函数和并发度 ``workers``::
+每个 Node 持有一个 ``fn(ctx)`` 函数和并发度 ``workers``:::
 
     items → wrap → Q₀ → [Node₀, w=W₀] → Q₁ → [Node₁, w=W₁] → Q₂ → … → results
              ↑                ↑ fn(ctx)→derive
@@ -49,13 +49,18 @@ Gather 模式（``gather=True``）
 
 from __future__ import annotations
 
+import abc
 import inspect
 import queue
 import random
 import threading
 import time
+import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
+
+from loguru import logger
 
 from rivus.context import Context
 from rivus.exceptions import (
@@ -65,11 +70,11 @@ from rivus.exceptions import (
     PipelineStop,
     PipelineTimeoutError,
 )
-from rivus.log import LogConfig, RivusLogger, build_logger, default_logger
 from rivus.node import BaseNode, Node
 
-# 队列结束哨兵
-_DONE = object()
+# 队列哨兵
+_DONE = object()   # 正常流结束
+_STOP = object()   # 紧急停止（级联传播，唤醒所有阻塞线程）
 
 
 # ---------------------------------------------------------------------------
@@ -150,24 +155,18 @@ class NodeReport:
 
 @dataclass
 class PipelineReport:
-    """Pipeline 运行完成后的汇总报告。"""
+    """Pipeline 单次运行完成后的汇总报告。"""
     pipeline_name: str
     status: str
     total_duration_s: float
+    run_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     results: list[Any] = field(default_factory=list)
-    """每个 item 最终的 ``ctx.get("input")`` 值。"""
-    contexts: list[Context] = field(default_factory=list)
-    """每个 item 的最终 Context，可访问完整派生链上的所有键。"""
     errors: list[BaseException] = field(default_factory=list)
     nodes: list[NodeReport] = field(default_factory=list)
 
     @property
     def succeeded(self) -> bool:
         return self.status == PipelineStatus.SUCCESS
-
-    def values(self, key: str = "input") -> list[Any]:
-        """从所有最终 Context 中提取指定 key 的值。"""
-        return [c.get(key) for c in self.contexts]
 
 
 # ---------------------------------------------------------------------------
@@ -216,37 +215,197 @@ def _mp_run(
 
 
 # ---------------------------------------------------------------------------
-# 单次运行共享状态（传递给各 worker / relay / collector 构造器）
+# RunStorage —— 可插拔后端的 _RunState 存储层
 # ---------------------------------------------------------------------------
 
 
-class _RunCtx:
-    """封装 _boot_workers 一次运行内所有工作线程共享的可变状态。"""
+class RunStorageBackend(abc.ABC):
+    """RunStorage 后端接口。自定义存储时继承此类并实现所有抽象方法。"""
+
+    @abc.abstractmethod
+    def save(self, run_id: str, state: "_RunState") -> None:
+        """Persist or cache a completed _RunState."""
+
+    @abc.abstractmethod
+    def get(self, run_id: str) -> "_RunState | None":
+        """Return the _RunState for *run_id*, or None if not found."""
+
+    @abc.abstractmethod
+    def list(self) -> list[str]:
+        """Return all known run_ids, ordered oldest → newest."""
+
+    @abc.abstractmethod
+    def clear(self) -> None:
+        """Remove all stored runs."""
+
+
+class InMemoryStorage(RunStorageBackend):
+    """LRU 内存实现。超过 *max_runs* 后自动淘汰最旧的 run。"""
+
+    def __init__(self, max_runs: int = 100) -> None:
+        self._max = max_runs
+        self._store: OrderedDict[str, "_RunState"] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def save(self, run_id: str, state: "_RunState") -> None:
+        with self._lock:
+            self._store[run_id] = state
+            self._store.move_to_end(run_id)
+            while len(self._store) > self._max:
+                self._store.popitem(last=False)
+
+    def get(self, run_id: str) -> "_RunState | None":
+        with self._lock:
+            return self._store.get(run_id)
+
+    def list(self) -> list[str]:
+        with self._lock:
+            return list(self._store.keys())
+
+    def clear(self) -> None:
+        with self._lock:
+            self._store.clear()
+
+
+class RunStorage:
+    """Pipeline 对外暴露的 run 状态管理接口。
+
+    通过 ``pipeline.storage`` 访问。默认使用 :class:`InMemoryStorage` 后端。
+    可在 ``Pipeline.__init__`` 中传入自定义 :class:`RunStorageBackend`。
+
+    Examples::
+
+        # 查询某次 run 的报告
+        state = pipeline.storage.get(run_id)
+        if state:
+            print(state.report)
+
+        # 列出所有 run_id
+        for rid in pipeline.storage.list():
+            print(rid)
+    """
+
+    def __init__(self, backend: RunStorageBackend) -> None:
+        self._backend = backend
+
+    def get(self, run_id: str) -> "_RunState | None":
+        """Return the _RunState for *run_id*, or None if not found."""
+        return self._backend.get(run_id)
+
+    def list(self) -> list[str]:
+        """Return all known run_ids, ordered oldest → newest."""
+        return self._backend.list()
+
+    def clear(self) -> None:
+        """Remove all stored runs from the backend."""
+        self._backend.clear()
+
+    def __getitem__(self, run_id: str) -> "_RunState":
+        state = self._backend.get(run_id)
+        if state is None:
+            raise KeyError(run_id)
+        return state
+
+    def __len__(self) -> int:
+        return len(self._backend.list())
+
+    def __contains__(self, run_id: object) -> bool:
+        return isinstance(run_id, str) and self._backend.get(run_id) is not None
+
+
+# ---------------------------------------------------------------------------
+# 单次运行状态（完全独立，每次 run 创建一个新实例）
+# ---------------------------------------------------------------------------
+
+
+class _RunState:
+    """封装一次 Pipeline.run() 内所有工作线程共享的可变状态。
+
+    每次调用 run() / run_background() / start() 都会创建一个全新的
+    _RunState 实例，使多次运行之间完全独立，互不影响。
+    """
 
     __slots__ = (
-        "stop_event", "errors", "errors_lock",
-        "ordered", "fail_fast", "new_seq", "root_ctx", "pipeline_name",
+        # 运行唯一标识
+        "run_id",
+        # 控制信号
+        "stop_event", "done_event",
+        # 提交队列
+        "q_submit",
+        # 序号（ordered 模式）
+        "seq_counter", "seq_lock",
+        # 结果与状态
+        "status", "status_lock",
+        "report", "exc",
+        # 错误收集
+        "errors", "errors_lock",
+        # 计时
+        "start_time",
+        # 运行参数（从 Pipeline 复制，避免闭包捕获 self）
+        "ordered", "fail_fast", "root_ctx", "pipeline_name",
     )
 
     def __init__(
         self,
-        stop_event: threading.Event,
-        errors: list,
-        errors_lock: threading.Lock,
         ordered: bool,
         fail_fast: bool,
-        new_seq: Callable,
         root_ctx: "Context",
         pipeline_name: str,
+        run_id: str | None = None,
     ) -> None:
-        self.stop_event = stop_event
-        self.errors = errors
-        self.errors_lock = errors_lock
+        self.run_id: str = run_id if run_id is not None else str(uuid.uuid4())
+        self.stop_event = threading.Event()
+        self.done_event = threading.Event()
+        self.q_submit: queue.Queue | None = None
+        self.seq_counter: int = 0
+        self.seq_lock = threading.Lock()
+        self.status: str = PipelineStatus.IDLE
+        self.status_lock = threading.Lock()
+        self.report: PipelineReport | None = None
+        self.exc: BaseException | None = None
+        self.errors: list = []
+        self.errors_lock = threading.Lock()
+        self.start_time: float = 0.0
         self.ordered = ordered
         self.fail_fast = fail_fast
-        self.new_seq = new_seq
         self.root_ctx = root_ctx
         self.pipeline_name = pipeline_name
+
+    def new_seq(self) -> int:
+        """分配一个新的序号（fan-out 时给每个 yielded item 分配新序号）。"""
+        with self.seq_lock:
+            seq = self.seq_counter
+            self.seq_counter += 1
+        return seq
+
+    def tag(self, item_ctx: "Context") -> Any:
+        """ordered 模式：给 ctx 打序号；非 ordered 模式直传。"""
+        if not self.ordered:
+            return item_ctx
+        with self.seq_lock:
+            seq = self.seq_counter
+            self.seq_counter += 1
+        return (seq, item_ctx)
+
+    def inject_stop(self) -> None:
+        """设置 stop_event 并向 q_submit 注入 _STOP 哨兵（级联停止）。"""
+        self.stop_event.set()
+        if self.q_submit is not None:
+            try:
+                self.q_submit.put_nowait(_STOP)
+            except queue.Full:
+                pass
+
+    def wait(self, timeout: float | None = None) -> "PipelineReport":
+        """阻塞直到本次运行完成，返回 PipelineReport。"""
+        finished = self.done_event.wait(timeout=timeout)
+        if not finished:
+            raise TimeoutError(
+                f"Pipeline '{self.pipeline_name}' did not finish within {timeout}s."
+            )
+        if self.exc is not None:
+            raise self.exc
+        return self.report  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
@@ -312,11 +471,8 @@ class Pipeline:
     Args:
         name: 流水线名称。
         context: 预初始化的 root Context；不传时自动创建。
-        log_config: 日志配置。
         fail_fast: 任意节点出错立即停止（默认 True）。
         ordered: 结果按提交顺序排列（有轻微额外开销）。
-        keep_contexts: 是否在报告中保留所有最终 Context 对象（大批量 item 时
-            建议保持默认 ``False`` 以降低内存占用）。
         timeout_grace: 超时触发后等待 collector 完成的宽限时间（秒，默认 5.0）。
     """
 
@@ -325,62 +481,51 @@ class Pipeline:
         name: str = "pipeline",
         *,
         context: Context | None = None,
-        log_config: LogConfig | RivusLogger | None = None,
         fail_fast: bool = True,
         ordered: bool = False,
-        keep_contexts: bool = False,
         timeout_grace: float = 5.0,
+        storage: RunStorageBackend | None = None,
+        max_runs: int = 100,
     ) -> None:
         self.name = name
         self.fail_fast = fail_fast
         self.ordered = ordered
-        self.keep_contexts = keep_contexts
         self.timeout_grace = timeout_grace
         self._nodes: list[Node] = []
 
-        if isinstance(log_config, RivusLogger):
-            _logger = log_config
-        elif log_config is None:
-            _logger = default_logger(f"rivus.{name}")
-        else:
-            from dataclasses import replace as _dc_replace
-            cfg = (
-                _dc_replace(log_config, name=f"rivus.{name}")
-                if log_config.name == "rivus"
-                else log_config
-            )
-            _logger = build_logger(cfg)
-
         self._ctx: Context = context or Context()
-        self._ctx._attach_logger(_logger)
+        self._ctx._attach_pipeline(self)
 
-        self._state_lock = threading.Lock()
-        self._status: str = PipelineStatus.IDLE
-        self._stop_event = threading.Event()
-        self._done_event = threading.Event()
-        self._report: PipelineReport | None = None
-        self._exc: BaseException | None = None
-        self._q_submit: queue.Queue | None = None
-        self._seq_counter: int = 0
-        self._seq_lock = threading.Lock()
-        self._start_time: float = 0.0
-
+        # ── per-pipeline 状态（跨 run 共享）──────────────────────────────
         # once 节点：记录已执行过一次的节点索引
         self._once_executed: set[int] = set()
+        self._once_lock = threading.Lock()
 
-        # 生命周期钩子
+        # 生命周期钉子
         self._init_done: bool = False
         self._hooks_init: list[Callable] = []
         self._hooks_start: list[Callable] = []
         self._hooks_end: list[Callable] = []
         self._hooks_failure: list[Callable] = []
 
-        self._ctx._attach_stop_event(self._stop_event)
-        self._ctx._attach_pipeline(self)
-
-        # 全局变量存储（Pipeline 生命周期内跨 item 共享）
+        # 全局变量存储（Pipeline 生命周期内跨 run 共享）
         self._vars: dict[str, Any] = {}
         self._vars_lock = threading.Lock()
+
+        # ── RunStorage ：关联所有 run 的 _RunState ────────────────────
+        _backend = storage if storage is not None else InMemoryStorage(
+            max_runs=max_runs)
+        self.storage = RunStorage(_backend)
+
+        # ── 当前活跃 run_id（用于 wait() / stop() / submit() / close() 委托）
+        # run() 是同步的，不需要此字段；
+        # run_background() / start() 会写入此字段。
+        self._active_run_id: str | None = None
+        self._active_run_lock = threading.Lock()
+
+        # ── 并发运行控制：同一时刻最多一个 run ────────────────────────────
+        self._running_lock = threading.Lock()
+        self._is_running: bool = False
 
     # ------------------------------------------------------------------
     # 全局变量 API
@@ -442,7 +587,7 @@ class Pipeline:
 
         接受 :class:`~rivus.Node`（函数式）或 :class:`~rivus.BaseNode`（类式）。
         """
-        if self._status == PipelineStatus.RUNNING:
+        if self._is_running:
             raise RuntimeError("Cannot add nodes while pipeline is running.")
         if isinstance(n, BaseNode):
             self._nodes.append(n._to_node())
@@ -537,37 +682,75 @@ class Pipeline:
 
     @property
     def status(self) -> str:
-        return self._status
+        """当前（或最近一次）运行的状态。"""
+        with self._active_run_lock:
+            rid = self._active_run_id
+        if rid is None:
+            ids = self.storage.list()
+            if ids:
+                state = self.storage.get(ids[-1])
+                if state is not None:
+                    with state.status_lock:
+                        return state.status
+            return PipelineStatus.IDLE
+        state = self.storage.get(rid)
+        if state is None:
+            return PipelineStatus.IDLE
+        with state.status_lock:
+            return state.status
 
     @property
     def result(self) -> PipelineReport | None:
-        return self._report
+        """最近一次运行的报告（run_background 场景下，完成前为 None）。"""
+        ids = self.storage.list()
+        if ids:
+            state = self.storage.get(ids[-1])
+            if state is not None:
+                return state.report
+        return None
 
     @property
     def is_running(self) -> bool:
-        return self._status == PipelineStatus.RUNNING
+        with self._running_lock:
+            return self._is_running
 
     # ------------------------------------------------------------------
-    # 控制
+    # 控制（委托给当前活跃 _RunState）
     # ------------------------------------------------------------------
 
     def stop(self) -> "Pipeline":
-        """发出停止信号（当前 item 处理完后生效）。"""
-        self._stop_event.set()
-        self._ctx.log.warning("Pipeline '%s': stop requested.", self.name)
+        """发出停止信号，立即唤醒所有阻塞中的工作线程。"""
+        with self._active_run_lock:
+            rid = self._active_run_id
+        if rid is not None:
+            state = self.storage.get(rid)
+            if state is not None:
+                state.inject_stop()
         return self
 
     def wait(self, timeout: float | None = None) -> PipelineReport:
-        """阻塞直到流水线完成。"""
-        finished = self._done_event.wait(timeout=timeout)
+        """阻塞直到当前后台/流式运行完成，返回本次 PipelineReport。"""
+        with self._active_run_lock:
+            rid = self._active_run_id
+        if rid is None:
+            raise RuntimeError(
+                f"Pipeline '{self.name}': no active run. "
+                "Call run_background() or start() first."
+            )
+        state = self.storage.get(rid)
+        if state is None:
+            raise RuntimeError(
+                f"Pipeline '{self.name}': run {rid!r} not found in storage."
+            )
+        finished = state.done_event.wait(timeout=timeout)
         if not finished:
             raise TimeoutError(
                 f"Pipeline '{self.name}' did not finish within {timeout}s. "
                 "Call stop() to cancel."
             )
-        if self._exc is not None:
-            raise self._exc
-        return self._report  # type: ignore[return-value]
+        if state.exc is not None:
+            raise state.exc
+        return state.report  # type: ignore[return-value]
 
     # ------------------------------------------------------------------
     # 运行
@@ -580,7 +763,10 @@ class Pipeline:
         timeout: float | None = None,
         repeat: int = 1,
     ) -> "PipelineReport | list[PipelineReport]":
-        """同步批量运行。
+        """同步批量运行，每次调用返回本次独立的 PipelineReport。
+
+        多次调用 run() 完全并发安全——每次运行拥有独立的 _RunState，
+        结果互不干扰。
 
         Args:
             items: 待处理的 item 可迭代对象。每个 item 会被包装为
@@ -606,20 +792,25 @@ class Pipeline:
             return [
                 self.run(*items, initial=initial, timeout=timeout)
                 for _ in range(repeat)
-            ]
-        self._assert_idle()
-        self._reset_state()
+            ]  # pyright: ignore[reportReturnType]
+
+        self._assert_not_running()
+
         if initial:
             self._ctx.update(initial)
         self._fire_start_hooks()
+
+        rs = self._new_run_state()
+
         if timeout is not None:
-            return self._run_with_timeout(items, timeout)
-        self._boot_workers()
-        with self._state_lock:
-            self._status = PipelineStatus.RUNNING
-        self._push_all(items)
-        self._q_submit.put(_DONE)  # type: ignore[union-attr]
-        return self.wait()
+            return self._run_with_timeout(items, rs, timeout)
+
+        self._boot_workers(rs)
+        with rs.status_lock:
+            rs.status = PipelineStatus.RUNNING
+        self._push_all(items, rs)
+        rs.q_submit.put(_DONE)  # type: ignore[union-attr]
+        return rs.wait()
 
     def run_background(
         self,
@@ -627,26 +818,27 @@ class Pipeline:
         initial: dict[str, Any] | None = None,
         timeout: float | None = None,
     ) -> "Pipeline":
-        """后台运行，立即返回。"""
-        self._assert_idle()
-        self._reset_state()
+        """后台运行，立即返回。调用 wait() 获取本次 PipelineReport。"""
+        self._assert_not_running()
+
         if initial:
             self._ctx.update(initial)
         self._fire_start_hooks()
 
-        def _target() -> None:
-            self._boot_workers()
-            with self._state_lock:
-                self._status = PipelineStatus.RUNNING
-            self._push_all(items)
-            self._q_submit.put(_DONE)  # type: ignore[union-attr]
+        rs = self._new_run_state()
 
-        threading.Thread(
-            target=_target, daemon=True, name=f"rivus-bg-{self.name}"
-        ).start()
+        def _target() -> None:
+            self._boot_workers(rs)
+            with rs.status_lock:
+                rs.status = PipelineStatus.RUNNING
+            self._push_all(items, rs)
+            rs.q_submit.put(_DONE)  # type: ignore[union-attr]
+
+        threading.Thread(target=_target, daemon=True,
+                         name=f"rivus-bg-{self.name}").start()
 
         if timeout is not None:
-            self._start_watchdog(timeout)
+            self._start_watchdog(rs, timeout)
         return self
 
     # ------------------------------------------------------------------
@@ -655,73 +847,78 @@ class Pipeline:
 
     def start(self, initial: dict[str, Any] | None = None) -> "Pipeline":
         """启动工作线程（流式模式）。之后调用 :meth:`submit` 逐条推送 item。"""
-        self._assert_idle()
-        self._reset_state()
+        self._assert_not_running()
+
         if initial:
             self._ctx.update(initial)
         self._fire_start_hooks()
-        self._boot_workers()
-        with self._state_lock:
-            self._status = PipelineStatus.RUNNING
-        self._ctx.log.info(
-            "Pipeline '%s' started (%d nodes).", self.name, len(self._nodes)
-        )
+
+        rs = self._new_run_state()
+
+        self._boot_workers(rs)
+        with rs.status_lock:
+            rs.status = PipelineStatus.RUNNING
+        logger.info(
+            f"Pipeline '{self.name}' started ({len(self._nodes)} nodes).")
         return self
 
     def submit(self, item: Any) -> "Pipeline":
         """提交单个 item（需先调用 :meth:`start`）。"""
-        if self._q_submit is None:
+        with self._active_run_lock:
+            rid = self._active_run_id
+        run = self.storage.get(rid) if rid else None
+        if run is None or run.q_submit is None:
             raise RuntimeError("Call start() before submit().")
-        if self._stop_event.is_set():
+        if run.stop_event.is_set():
             raise RuntimeError(f"Pipeline '{self.name}' has been stopped.")
         item_ctx = item if isinstance(
             item, Context) else self._ctx.derive(input=item)
-        self._q_submit.put(self._tag(item_ctx))
+        run.q_submit.put(run.tag(item_ctx))
         return self
 
     def close(self) -> "Pipeline":
         """通知流水线不再有新 item（流式模式）。"""
-        if self._q_submit is None:
+        with self._active_run_lock:
+            rid = self._active_run_id
+        run = self.storage.get(rid) if rid else None
+        if run is None or run.q_submit is None:
             raise RuntimeError("Call start() before close().")
-        self._q_submit.put(_DONE)
+        run.q_submit.put(_DONE)
         return self
 
     # ------------------------------------------------------------------
     # 内部：状态管理
     # ------------------------------------------------------------------
 
-    def _assert_idle(self) -> None:
-        if self._status == PipelineStatus.RUNNING:
-            raise RuntimeError(
-                f"Pipeline '{self.name}' is already running. "
-                "Call wait() or stop() first."
-            )
+    def _assert_not_running(self) -> None:
+        with self._running_lock:
+            if self._is_running:
+                raise RuntimeError(
+                    f"Pipeline '{self.name}' is already running. "
+                    "Call wait() or stop() first."
+                )
+            self._is_running = True
 
-    def _reset_state(self) -> None:
-        self._stop_event.clear()
-        self._done_event.clear()
-        self._report = None
-        self._exc = None
-        self._q_submit = None
-        self._seq_counter = 0
-        with self._state_lock:
-            self._status = PipelineStatus.IDLE
+    def _mark_done(self) -> None:
+        """由 collector 线程在本次运行结束后调用，释放运行锁，清除活跃 run_id。"""
+        with self._active_run_lock:
+            self._active_run_id = None
+        with self._running_lock:
+            self._is_running = False
 
-    def _tag(self, item_ctx: Context) -> Any:
-        """ordered 模式：给 ctx 打序号；非 ordered 模式直传。"""
-        if not self.ordered:
-            return item_ctx
-        with self._seq_lock:
-            seq = self._seq_counter
-            self._seq_counter += 1
-        return (seq, item_ctx)
-
-    def _new_seq(self) -> int:
-        """分配一个新的序号（fan-out 时给每个 yielded item 分配新序号）。"""
-        with self._seq_lock:
-            seq = self._seq_counter
-            self._seq_counter += 1
-        return seq
+    def _new_run_state(self) -> _RunState:
+        """创建并返回一个全新的 _RunState，代表本次运行的完整独立状态。"""
+        rs = _RunState(
+            ordered=self.ordered,
+            fail_fast=self.fail_fast,
+            root_ctx=self._ctx,
+            pipeline_name=self.name,
+        )
+        # 存入 storage，设置当前活跃 run_id
+        self.storage._backend.save(rs.run_id, rs)
+        with self._active_run_lock:
+            self._active_run_id = rs.run_id
+        return rs
 
     # ------------------------------------------------------------------
     # 内部：工作线程引导 —— 各组件构造器
@@ -736,27 +933,25 @@ class Pipeline:
         stop_event: threading.Event,
         label: str = "",
     ) -> threading.Thread:
-        """relay 线程：等待上游 expect 个 _DONE 后，向下游发出 forward 个 _DONE。"""
+        """relay 线程：等待上游 expect 个 _DONE 后，向下游发出 forward 个 _DONE。
+
+        收到 _STOP 时立即转发并退出（级联停止）。
+        """
         def _relay() -> None:
             done_count = 0
             while True:
-                try:
-                    item = in_q.get(timeout=0.1)
-                except queue.Empty:
-                    if stop_event.is_set():
-                        for _ in range(forward):
-                            out_q.put(_DONE)
-                        return
-                    continue
+                item = in_q.get()  # 真正阻塞，无轮询
+                if item is _STOP:
+                    out_q.put(_STOP)  # 立即向下游转发
+                    return
                 if item is _DONE:
                     done_count += 1
                     if done_count >= expect:
                         for _ in range(forward):
                             out_q.put(_DONE)
                         return
-                elif not stop_event.is_set():
+                else:
                     out_q.put(item)
-                # stop_event 已设置：丢弃 item，避免向有界队列写满导致死锁
 
         return threading.Thread(target=_relay, daemon=True, name=f"rivus-relay-{label}")
 
@@ -773,23 +968,21 @@ class Pipeline:
     ) -> threading.Thread:
         """gather relay：收集上游全部 item，合并为单个 list 后传入下游节点。
 
-        下游节点收到的 ``ctx.require("input")`` 将是所有上游结果值组成的列表。
+        下游节点收到的 ``ctx.require("input")`` 将是所有上游结果値组成的列表。
         合并 ctx 以**第一个到达的上游 item ctx** 为基础派生，从而保留上游节点
         写入 ctx 的所有数据（``ctx.set(...)``）；若无 item 则回退到 root_ctx。
+
+        收到 _STOP 时立即转发并退出（丢弃已收集的部分结果）。
         """
         def _relay() -> None:
             collected: list = []
             base_ctx: "Context | None" = None
             done_count = 0
             while True:
-                try:
-                    item = in_q.get(timeout=0.1)
-                except queue.Empty:
-                    if stop_event.is_set():
-                        for _ in range(forward):
-                            out_q.put(_DONE)
-                        return
-                    continue
+                item = in_q.get()  # 真正阻塞，无轮询
+                if item is _STOP:
+                    out_q.put(_STOP)  # 立即转发，丢弃已收集部分
+                    return
                 if item is _DONE:
                     done_count += 1
                     if done_count >= expect:
@@ -799,24 +992,22 @@ class Pipeline:
                         for _ in range(forward):
                             out_q.put(_DONE)
                         return
-                elif not stop_event.is_set():
+                else:
                     ctx_item = item[1] if ordered else item
                     if base_ctx is None:
                         base_ctx = ctx_item
                     collected.append(ctx_item.get("input"))
-                # stop_event 已设置：丢弃 item
 
         return threading.Thread(target=_relay, daemon=True, name=f"rivus-gather-{label}")
 
     @staticmethod
-    def _ctx_from_dict(data: dict, rc: "_RunCtx") -> "Context":
+    def _ctx_from_dict(data: dict, rs: "_RunState") -> "Context":
         """从子进程返回的 dict 重建 Context，附加日志器和停止信号。"""
         ctx = Context(data)
-        ctx._attach_logger(rc.root_ctx._logger)
-        ev = getattr(rc.root_ctx, "_stop_event_ref", None)
+        ev = getattr(rs.root_ctx, "_stop_event_ref", None)
         if ev is not None:
             ctx._attach_stop_event(ev)
-        pl = getattr(rc.root_ctx, "_pipeline_ref", None)
+        pl = getattr(rs.root_ctx, "_pipeline_ref", None)
         if pl is not None:
             ctx._attach_pipeline(pl)
         return ctx
@@ -829,27 +1020,25 @@ class Pipeline:
         in_q: queue.Queue,
         out_q: queue.Queue,
         nr: NodeReport,
-        rc: "_RunCtx",
+        rs: "_RunState",
     ) -> Callable:
         """返回线程 worker 函数（供同节点 N 个 Thread 复用同一闭包）。"""
         def _worker() -> None:
             while True:
-                try:
-                    tagged = in_q.get(timeout=0.05)
-                except queue.Empty:
-                    if rc.stop_event.is_set():
-                        out_q.put(_DONE)
-                        return
-                    continue
+                tagged = in_q.get()  # 真正阻塞，无轮询
 
+                if tagged is _STOP:
+                    in_q.put(_STOP)   # re-inject：唤醒同节点其他 worker
+                    out_q.put(_STOP)   # 向下游转发
+                    return
                 if tagged is _DONE:
                     out_q.put(_DONE)
                     return
-                if rc.stop_event.is_set():
+                if rs.stop_event.is_set():
                     out_q.put(_DONE)
                     return
 
-                seq, item_ctx = tagged if rc.ordered else (None, tagged)
+                seq, item_ctx = tagged if rs.ordered else (None, tagged)
 
                 with nr._lock:
                     nr.items_in += 1
@@ -863,28 +1052,28 @@ class Pipeline:
                         for val in result:
                             out_ctx = val if isinstance(
                                 val, Context) else item_ctx.derive(input=val)
-                            out_q.put((rc.new_seq(), out_ctx)
-                                      if rc.ordered else out_ctx)
+                            out_q.put((rs.new_seq(), out_ctx)
+                                      if rs.ordered else out_ctx)
                             _count += 1
                         with nr._lock:
                             nr.items_out += _count
                             nr._update_timing(time.perf_counter() - _t0)
 
                     elif result is None:
-                        out_q.put((seq, item_ctx) if rc.ordered else item_ctx)
+                        out_q.put((seq, item_ctx) if rs.ordered else item_ctx)
                         with nr._lock:
                             nr.items_out += 1
                             nr._update_timing(time.perf_counter() - _t0)
 
                     elif isinstance(result, Context):
-                        out_q.put((seq, result) if rc.ordered else result)
+                        out_q.put((seq, result) if rs.ordered else result)
                         with nr._lock:
                             nr.items_out += 1
                             nr._update_timing(time.perf_counter() - _t0)
 
                     else:
                         out_ctx = item_ctx.derive(input=result)
-                        out_q.put((seq, out_ctx) if rc.ordered else out_ctx)
+                        out_q.put((seq, out_ctx) if rs.ordered else out_ctx)
                         with nr._lock:
                             nr.items_out += 1
                             nr._update_timing(time.perf_counter() - _t0)
@@ -892,17 +1081,13 @@ class Pipeline:
                 except NodeSkip as skip_exc:
                     with nr._lock:
                         nr.items_skipped += 1
-                    rc.root_ctx.log.debug(
-                        "Pipeline '%s' node '%s' skipped item: %s",
-                        rc.pipeline_name, nname, skip_exc.message,
-                    )
+                    logger.debug(
+                        f"Pipeline '{rs.pipeline_name}' node '{nname}' skipped item: {skip_exc.message}")
 
                 except PipelineStop as stop_exc:
-                    rc.root_ctx.log.info(
-                        "Pipeline '%s' stop requested by node '%s': %s",
-                        rc.pipeline_name, nname, stop_exc,
-                    )
-                    rc.stop_event.set()
+                    logger.debug(
+                        f"Pipeline '{rs.pipeline_name}' stop requested by node '{nname}': {stop_exc}")
+                    rs.inject_stop()
                     out_q.put(_DONE)
                     return
 
@@ -910,10 +1095,10 @@ class Pipeline:
                     with nr._lock:
                         nr.errors += 1
                         nr._update_timing(time.perf_counter() - _t0)
-                    with rc.errors_lock:
-                        rc.errors.append(NodeError(nname, exc))
-                    if rc.fail_fast:
-                        rc.stop_event.set()
+                    with rs.errors_lock:
+                        rs.errors.append(NodeError(nname, exc))
+                    if rs.fail_fast:
+                        rs.inject_stop()
                         out_q.put(_DONE)
                         return
 
@@ -928,11 +1113,11 @@ class Pipeline:
         in_q: queue.Queue,
         out_q: queue.Queue,
         nr: NodeReport,
-        rc: "_RunCtx",
+        rs: "_RunState",
     ) -> Callable:
         """返回进程模式协调函数（单线程驱动 ProcessPoolExecutor）。"""
         def _coordinator() -> None:
-            from concurrent.futures import ProcessPoolExecutor
+            from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 
             pending: dict = {}   # future → (seq, item_ctx)
             done_count = 0
@@ -940,7 +1125,7 @@ class Pipeline:
 
             with ProcessPoolExecutor(max_workers=n_workers) as executor:
                 while True:
-                    # ── 处理已完成的 future ───────────────────────────
+                    # ── 处理已完成的 future ───────────────────
                     for future in [f for f in list(pending) if f.done()]:
                         seq, item_ctx = pending.pop(future)
                         try:
@@ -950,40 +1135,37 @@ class Pipeline:
                             if res_type == "skip":
                                 with nr._lock:
                                     nr.items_skipped += 1
-                                rc.root_ctx.log.debug(
-                                    "Pipeline '%s' node '%s' skipped item: %s",
-                                    rc.pipeline_name, nname, res_data,
-                                )
+                                logger.debug(f"Pipeline '{rs.pipeline_name}' node '{nname}' skipped item: {res_data}")
                             elif res_type == "gen":
                                 for vtype, vdata in res_data:
                                     out_ctx = (
-                                        self._ctx_from_dict(vdata, rc)
+                                        self._ctx_from_dict(vdata, rs)
                                         if vtype == "ctx"
                                         else item_ctx.derive(input=vdata)
                                     )
-                                    out_q.put((rc.new_seq(), out_ctx)
-                                              if rc.ordered else out_ctx)
+                                    out_q.put((rs.new_seq(), out_ctx)
+                                              if rs.ordered else out_ctx)
                                     with nr._lock:
                                         nr.items_out += 1
                             else:
                                 out_ctx = (
-                                    self._ctx_from_dict(res_data, rc)
+                                    self._ctx_from_dict(res_data, rs)
                                     if res_type in ("none", "ctx")
                                     else item_ctx.derive(input=res_data)
                                 )
                                 out_q.put((seq, out_ctx)
-                                          if rc.ordered else out_ctx)
+                                          if rs.ordered else out_ctx)
                                 with nr._lock:
                                     nr.items_out += 1
                         except Exception as exc:
                             with nr._lock:
                                 nr.errors += 1
-                            with rc.errors_lock:
-                                rc.errors.append(NodeError(nname, exc))
-                            if rc.fail_fast:
-                                rc.stop_event.set()
+                            with rs.errors_lock:
+                                rs.errors.append(NodeError(nname, exc))
+                            if rs.fail_fast:
+                                rs.inject_stop()
 
-                    if rc.stop_event.is_set():
+                    if rs.stop_event.is_set():
                         for f in list(pending):
                             f.cancel()
                         pending.clear()
@@ -992,14 +1174,20 @@ class Pipeline:
                     if input_exhausted and not pending:
                         break
                     if input_exhausted:
-                        time.sleep(0.005)
+                        # 等待任意一个 future 完成，替代 sleep(0.005) 空转
+                        wait(list(pending), timeout=0.1,
+                             return_when=FIRST_COMPLETED)
                         continue
 
-                    # ── 读取下一个 input ──────────────────────────────
-                    try:
-                        tagged = in_q.get(timeout=0.05)
-                    except queue.Empty:
-                        continue
+                    # ── 读取下一个 input ──────────────────
+                    tagged = in_q.get()  # 真正阻塞，无轮询
+
+                    if tagged is _STOP:
+                        for f in list(pending):
+                            f.cancel()
+                        pending.clear()
+                        out_q.put(_STOP)
+                        return
 
                     if tagged is _DONE:
                         done_count += 1
@@ -1007,7 +1195,7 @@ class Pipeline:
                             input_exhausted = True
                         continue
 
-                    seq, item_ctx = tagged if rc.ordered else (None, tagged)
+                    seq, item_ctx = tagged if rs.ordered else (None, tagged)
                     with nr._lock:
                         nr.items_in += 1
                     pending[executor.submit(_mp_run, fn, item_ctx.snapshot(), is_gen)] = (
@@ -1023,63 +1211,59 @@ class Pipeline:
         self,
         q_results: queue.Queue,
         node_reports: list,
-        rc: "_RunCtx",
+        rs: "_RunState",
     ) -> threading.Thread:
         """创建结果收集线程，负责排序、生成报告、设置最终状态。"""
         def _collect() -> None:
             raw: list = []
             while True:
-                try:
-                    item = q_results.get(timeout=0.05)
-                except queue.Empty:
-                    continue
-                if item is _DONE:
+                item = q_results.get()  # 真正阻塞，无轮询
+                if item is _DONE or item is _STOP:
                     break
                 raw.append(item)
 
-            if rc.ordered:
+            if rs.ordered:
                 raw.sort(key=lambda x: x[0])
                 final_ctxs = [ctx for _, ctx in raw]
             else:
                 final_ctxs = raw
 
-            total_duration = time.perf_counter() - self._start_time
+            total_duration = time.perf_counter() - rs.start_time
 
-            with self._state_lock:
-                if self._status == PipelineStatus.TIMEOUT:
+            with rs.status_lock:
+                if rs.status == PipelineStatus.TIMEOUT:
                     final_status = PipelineStatus.TIMEOUT
-                elif rc.stop_event.is_set() and not rc.errors:
+                elif rs.stop_event.is_set() and not rs.errors:
                     final_status = PipelineStatus.STOPPED
-                elif rc.errors and rc.fail_fast:
+                elif rs.errors and rs.fail_fast:
                     final_status = PipelineStatus.FAILED
                 else:
                     final_status = PipelineStatus.SUCCESS
-                self._status = final_status
+                rs.status = final_status
 
-            self._report = PipelineReport(
-                pipeline_name=self.name,
+            rs.report = PipelineReport(
+                pipeline_name=rs.pipeline_name,
                 status=final_status,
                 total_duration_s=total_duration,
+                run_id=rs.run_id,
                 results=[c.get("input") for c in final_ctxs],
-                contexts=final_ctxs if self.keep_contexts else [],
-                errors=list(rc.errors),
+                errors=list(rs.errors),
                 nodes=node_reports,
             )
 
-            log = rc.root_ctx.log
             if final_status == PipelineStatus.SUCCESS:
-                log.info("Pipeline '%s' succeeded in %.3fs, %d results.",
-                         self.name, total_duration, len(final_ctxs))
+                logger.info(
+                    f"Pipeline '{self.name}' succeeded in {total_duration:.3f}s, {len(final_ctxs)} results.")
             elif final_status == PipelineStatus.FAILED:
-                log.error("Pipeline '%s' failed in %.3fs.",
-                          self.name, total_duration)
-                self._exc = PipelineError(self.name, rc.errors[0])
+                logger.error(
+                    f"Pipeline '{self.name}' failed in {total_duration:.3f}s.")
+                rs.exc = PipelineError(self.name, rs.errors[0])
             elif final_status == PipelineStatus.STOPPED:
-                log.warning("Pipeline '%s' stopped after %.3fs.",
-                            self.name, total_duration)
+                logger.warning(
+                    f"Pipeline '{self.name}' stopped after {total_duration:.3f}s.")
             else:
-                log.error("Pipeline '%s' timed out after %.3fs.",
-                          self.name, total_duration)
+                logger.error(
+                    f"Pipeline '{self.name}' timed out after {total_duration:.3f}s.")
 
             # ── 生命周期钩子 ──────────────────────────────────────────
             hooks = (
@@ -1089,14 +1273,15 @@ class Pipeline:
             )
             for h in hooks:
                 try:
-                    h(self._report)
+                    h(rs.report)
                 except Exception as hook_exc:
-                    log.warning(
-                        "Pipeline '%s': hook %r raised: %s",
-                        self.name, getattr(h, "__name__", h), hook_exc,
+                    logger.warning(
+                        f"Pipeline '{self.name}': hook {getattr(h, '__name__', h)} raised: {hook_exc}"
                     )
 
-            self._done_event.set()
+            # 释放运行锁，允许下一次 run
+            self._mark_done()
+            rs.done_event.set()
 
         return threading.Thread(target=_collect, daemon=True, name=f"rivus-collector-{self.name}")
 
@@ -1104,7 +1289,7 @@ class Pipeline:
     # 内部：工作线程引导 —— 编排入口
     # ------------------------------------------------------------------
 
-    def _boot_workers(self) -> None:
+    def _boot_workers(self, rs: "_RunState") -> None:
         """创建并启动所有队列、relay / worker / collector 线程。"""
         if not self._nodes:
             raise RuntimeError(
@@ -1115,9 +1300,10 @@ class Pipeline:
 
         # ── 节点初始化 ────────────────────────────────────────────────
         # once 节点：首次运行时调用 setup_fn，后续跳过
-        for i, nd in enumerate(nodes):
-            if nd.setup_fn is not None and not (nd.once and i in self._once_executed):
-                nd.setup_fn(self._ctx)
+        with self._once_lock:
+            for i, nd in enumerate(nodes):
+                if nd.setup_fn is not None and not (nd.once and i in self._once_executed):
+                    nd.setup_fn(self._ctx)
 
         node_reports = [
             NodeReport(name=nd.name, workers=nd.workers,
@@ -1125,82 +1311,78 @@ class Pipeline:
             for nd in nodes
         ]
 
-        rc = _RunCtx(
-            stop_event=self._stop_event,
-            errors=[],
-            errors_lock=threading.Lock(),
-            ordered=self.ordered,
-            fail_fast=self.fail_fast,
-            new_seq=self._new_seq,
-            root_ctx=self._ctx,
-            pipeline_name=self.name,
-        )
-
         # ── 队列 ──────────────────────────────────────────────────────
         q_submit: queue.Queue = queue.Queue()
         q_in = [queue.Queue(maxsize=nd.queue_size) for nd in nodes]
         q_out = [queue.Queue() for _ in nodes]
         q_results: queue.Queue = queue.Queue()
-        self._q_submit = q_submit
+        rs.q_submit = q_submit
+
+        # ── 为本次 run 注入独立 stop_event ───────────────────────────
+        # root_ctx 是 per-pipeline 的，stop_event 是 per-run 的；
+        # 通过附加到 root_ctx，使 ctx.derive() 自动将本次 stop_event
+        # 传播到所有 item ctx。
+        self._ctx._attach_stop_event(rs.stop_event)
 
         # ── Relay 线程 ────────────────────────────────────────────────
         relay_threads = [
             self._make_relay(
-                q_submit, q_in[0], 1, nodes[0].workers, rc.stop_event, f"{self.name}/0"),
+                q_submit, q_in[0], 1, nodes[0].workers, rs.stop_event, f"{self.name}/0"),
             *[
                 self._make_gather_relay(
                     q_out[i], q_in[i + 1],
                     expect=nodes[i].workers,
                     forward=nodes[i + 1].workers,
-                    ordered=rc.ordered,
-                    stop_event=rc.stop_event,
-                    root_ctx=rc.root_ctx,
+                    ordered=rs.ordered,
+                    stop_event=rs.stop_event,
+                    root_ctx=rs.root_ctx,
                     label=f"{self.name}/{i}→{i+1}",
                 ) if nodes[i + 1].gather else
                 self._make_relay(q_out[i], q_in[i + 1], nodes[i].workers,
-                                 nodes[i + 1].workers, rc.stop_event, f"{self.name}/{i}→{i+1}")
+                                 nodes[i + 1].workers, rs.stop_event, f"{self.name}/{i}→{i+1}")
                 for i in range(n - 1)
             ],
             self._make_relay(
-                q_out[-1], q_results, nodes[-1].workers, 1, rc.stop_event, f"{self.name}/out"),
+                q_out[-1], q_results, nodes[-1].workers, 1, rs.stop_event, f"{self.name}/out"),
         ]
 
         # ── Worker 线程 ───────────────────────────────────────────────
         worker_threads: list[threading.Thread] = []
-        for i, nd in enumerate(nodes):
-            if nd.once and i in self._once_executed:
-                # once 节点已在前次 run() 执行过，直接透传 item
-                t = self._make_relay(
-                    q_in[i], q_out[i],
-                    expect=nd.workers, forward=nd.workers,
-                    stop_event=rc.stop_event,
-                    label=f"{self.name}/{nd.name}/once-skip",
-                )
-                worker_threads.append(t)
-            else:
-                if nd.once:
-                    # 首次执行，标记为已完成；下次 run() 将透传
-                    self._once_executed.add(i)
-                if nd.concurrency_type == "process":
-                    worker_threads.append(threading.Thread(
-                        target=self._make_process_coordinator(
-                            nd.fn, nd.name, nd.is_generator, nd.workers,
-                            q_in[i], q_out[i], node_reports[i], rc,
-                        ),
-                        daemon=True, name=f"rivus-proc-{nd.name}",
-                    ))
-                else:
-                    fn = self._make_thread_worker(
-                        nd.fn, nd.name, nd.is_generator,
-                        q_in[i], q_out[i], node_reports[i], rc,
+        with self._once_lock:
+            for i, nd in enumerate(nodes):
+                if nd.once and i in self._once_executed:
+                    # once 节点已在前次 run() 执行过，直接透传 item
+                    t = self._make_relay(
+                        q_in[i], q_out[i],
+                        expect=nd.workers, forward=nd.workers,
+                        stop_event=rs.stop_event,
+                        label=f"{self.name}/{nd.name}/once-skip",
                     )
-                    for _ in range(nd.workers):
+                    worker_threads.append(t)
+                else:
+                    if nd.once:
+                        # 首次执行，标记为已完成；下次 run() 将透传
+                        self._once_executed.add(i)
+                    if nd.concurrency_type == "process":
                         worker_threads.append(threading.Thread(
-                            target=fn, daemon=True, name=f"rivus-{nd.name}"))
+                            target=self._make_process_coordinator(
+                                nd.fn, nd.name, nd.is_generator, nd.workers,
+                                q_in[i], q_out[i], node_reports[i], rs,
+                            ),
+                            daemon=True, name=f"rivus-proc-{nd.name}",
+                        ))
+                    else:
+                        fn = self._make_thread_worker(
+                            nd.fn, nd.name, nd.is_generator,
+                            q_in[i], q_out[i], node_reports[i], rs,
+                        )
+                        for _ in range(nd.workers):
+                            worker_threads.append(threading.Thread(
+                                target=fn, daemon=True, name=f"rivus-{nd.name}"))
 
         # ── 启动 ──────────────────────────────────────────────────────
-        collector = self._make_collector(q_results, node_reports, rc)
-        self._start_time = time.perf_counter()
+        collector = self._make_collector(q_results, node_reports, rs)
+        rs.start_time = time.perf_counter()
         for t in relay_threads + worker_threads + [collector]:
             t.start()
 
@@ -1208,29 +1390,33 @@ class Pipeline:
     # 内部：提交辅助
     # ------------------------------------------------------------------
 
-    def _push_all(self, items: Iterable[Any] | None) -> None:
+    def _push_all(self, items: Iterable[Any] | None, rs: "_RunState") -> None:
         items = items or [None]
 
         for item in items:
-            if self._stop_event.is_set():
+            if rs.stop_event.is_set():
                 break
             item_ctx = item if isinstance(
                 item, Context) else self._ctx.derive(input=item)
-            self._q_submit.put(self._tag(item_ctx))  # type: ignore[union-attr]
+            rs.q_submit.put(rs.tag(item_ctx))  # type: ignore[union-attr]
 
     # ------------------------------------------------------------------
     # 内部：超时 & 看门狗
     # ------------------------------------------------------------------
 
-    def _run_with_timeout(self, items: Iterable[Any] | None, timeout: float) -> PipelineReport:
-        exc_box: list[BaseException] = []
+    def _run_with_timeout(
+        self,
+        items: Iterable[Any] | None,
+        rs: "_RunState",
+        timeout: float,
+    ) -> PipelineReport:
 
         def _target() -> None:
-            self._boot_workers()
-            with self._state_lock:
-                self._status = PipelineStatus.RUNNING
-            self._push_all(items)
-            self._q_submit.put(_DONE)  # type: ignore[union-attr]
+            self._boot_workers(rs)
+            with rs.status_lock:
+                rs.status = PipelineStatus.RUNNING
+            self._push_all(items, rs)
+            rs.q_submit.put(_DONE)  # type: ignore[union-attr]
 
         th = threading.Thread(target=_target, daemon=True,
                               name=f"rivus-{self.name}")
@@ -1238,39 +1424,49 @@ class Pipeline:
         th.join(timeout=timeout)
 
         if th.is_alive():
-            self._stop_event.set()
-            self._done_event.wait(timeout=self.timeout_grace)
-            with self._state_lock:
-                if self._status == PipelineStatus.RUNNING:
-                    self._status = PipelineStatus.TIMEOUT
+            rs.stop_event.set()
+            if rs.q_submit is not None:
+                try:
+                    rs.q_submit.put_nowait(_STOP)
+                except queue.Full:
+                    pass
+            rs.done_event.wait(timeout=self.timeout_grace)
+            with rs.status_lock:
+                if rs.status == PipelineStatus.RUNNING:
+                    rs.status = PipelineStatus.TIMEOUT
             exc = PipelineTimeoutError(self.name, timeout)
-            self._exc = exc
-            self._done_event.set()
-            self._ctx.log.error(
-                "Pipeline '%s' timed out after %.1fs.", self.name, timeout
+            rs.exc = exc
+            rs.done_event.set()
+            logger.error(
+                f"Pipeline '{self.name}' timed out after {timeout:.1f}s."
             )
             raise exc
 
-        self._done_event.wait(timeout=self.timeout_grace)
-        if self._exc is not None:
-            raise self._exc
-        return self._report  # type: ignore[return-value]
+        rs.done_event.wait(timeout=self.timeout_grace)
+        if rs.exc is not None:
+            raise rs.exc
+        return rs.report  # type: ignore[return-value]
 
-    def _start_watchdog(self, timeout: float) -> None:
+    def _start_watchdog(self, rs: "_RunState", timeout: float) -> None:
         def _watchdog() -> None:
-            finished = self._done_event.wait(timeout=timeout)
+            finished = rs.done_event.wait(timeout=timeout)
             if not finished:
-                self._stop_event.set()
+                rs.stop_event.set()
+                if rs.q_submit is not None:
+                    try:
+                        rs.q_submit.put_nowait(_STOP)
+                    except queue.Full:
+                        pass
                 timed_out = False
-                with self._state_lock:
-                    if self._status == PipelineStatus.RUNNING:
-                        self._status = PipelineStatus.TIMEOUT
-                        self._exc = PipelineTimeoutError(self.name, timeout)
+                with rs.status_lock:
+                    if rs.status == PipelineStatus.RUNNING:
+                        rs.status = PipelineStatus.TIMEOUT
+                        rs.exc = PipelineTimeoutError(self.name, timeout)
                         timed_out = True
                 if timed_out:
-                    self._done_event.set()
-                    self._ctx.log.error(
-                        "Pipeline '%s' timed out after %.1fs.", self.name, timeout
+                    rs.done_event.set()
+                    logger.error(
+                        f"Pipeline '{self.name}' timed out after {timeout:.1f}s."
                     )
 
         threading.Thread(
@@ -1279,6 +1475,6 @@ class Pipeline:
 
     def __repr__(self) -> str:
         return (
-            f"Pipeline(name={self.name!r}, status={self._status!r}, "
+            f"Pipeline(name={self.name!r}, status={self.status!r}, "
             f"nodes={[n.name for n in self._nodes]})"
         )

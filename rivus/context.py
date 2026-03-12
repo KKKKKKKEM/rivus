@@ -8,7 +8,6 @@ from threading import RLock
 from typing import Any, Iterator, TypeVar, overload
 
 from rivus.exceptions import ContextKeyError, PipelineStop
-from rivus.log import RivusLogger, default_logger
 
 T = TypeVar("T")
 
@@ -21,16 +20,14 @@ class Context:
         >>> ctx.set("preprocess.resized", True)
         >>> ctx.require("image_path")
         '/data/img.jpg'
-        >>> ctx.log.info("context ready")
+        >>> print("context ready")
     """
 
     def __init__(
         self,
         initial: dict[str, Any] | None = None,
-        logger: RivusLogger | None = None,
     ) -> None:
         self._data: dict[str, Any] = dict(initial) if initial else {}
-        self._logger: RivusLogger = logger or default_logger()
         self._lock = RLock()
 
     # ------------------------------------------------------------------
@@ -111,27 +108,6 @@ class Context:
     def __setstate__(self, state: dict) -> None:
         self._data = state["_data"]
         self._lock = RLock()
-        self._logger = default_logger()
-
-    # ------------------------------------------------------------------
-    # 日志器
-    # ------------------------------------------------------------------
-
-    @property
-    def log(self) -> RivusLogger:
-        """内置日志器，通过 Pipeline 的 log_config 统一配置。
-
-        Examples::
-
-            ctx.log.info("loaded %d samples", n)
-            ctx.log.warning("missing key, using default")
-            ctx.log.bind(stage="inference").debug("logits=%s", logits)
-        """
-        return self._logger
-
-    def _attach_logger(self, logger: RivusLogger) -> None:
-        """由 Pipeline 内部调用，将配置好的日志器绑定到此 Context。"""
-        self._logger = logger
 
     def _attach_pipeline(self, pipeline: Any) -> None:
         """由 Pipeline 内部调用，将自身引用绑定到此 Context。"""
@@ -186,7 +162,7 @@ class Context:
             def heavy_compute(ctx: Context) -> None:
                 for chunk in data_chunks:
                     if ctx.stop_requested:
-                        ctx.log.warning("stop requested, exiting early")
+                        print("stop requested, exiting early")
                         return
                     process(chunk)
         """
@@ -218,7 +194,6 @@ class Context:
         """
         with self._lock:
             child = Context(dict(self._data))
-        child._attach_logger(self._logger)
         ev = getattr(self, "_stop_event_ref", None)
         if ev is not None:
             child._attach_stop_event(ev)

@@ -268,24 +268,6 @@ print(report.results)   # [1, 2]（第 3 条触发 stop）
 
 ---
 
-## 12. 日志配置
-
-```python
-import rivus
-
-pipeline = rivus.Pipeline(
-    "my_pipeline",
-    log_config=rivus.LogConfig(
-        level="DEBUG",
-        to_console=True,
-        to_file="pipeline.log",
-        file_mode="w",
-    )
-)
-```
-
----
-
 ## 完整示例（参考 `examples/demo.py`）
 
 ```python
@@ -312,7 +294,7 @@ def step4(ctx: rivus.Context):
     items = ctx.require("input")   # list of 20 results
     return f"merged: {len(items)} items"
 
-pipeline = rivus.Pipeline("demo", log_config=rivus.LogConfig(level="INFO"))
+pipeline = rivus.Pipeline("demo")
 pipeline.add_nodes(step1, step2, step3, step4)
 report = pipeline.run()
 print(report.results)

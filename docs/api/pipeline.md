@@ -26,20 +26,23 @@ Pipeline(
     name: str = "pipeline",
     *,
     context: Context | None = None,
-    log_config: LogConfig | RivusLogger | None = None,
     fail_fast: bool = True,
     ordered: bool = False,
+    timeout_grace: float = 5.0,
+    storage: RunStorageBackend | None = None,
+    max_runs: int = 100,
 )
 ```
 
-| 参数         | 类型                                   | 默认值       | 说明                                       |
-| ------------ | -------------------------------------- | ------------ | ------------------------------------------ |
-| `name`       | `str`                                  | `"pipeline"` | 流水线名称，用于日志标识                   |
-| `context`    | `Context` \| `None`                    | `None`       | 预初始化的 root Context；不传时自动创建    |
-| `log_config` | `LogConfig` \| `RivusLogger` \| `None` | `None`       | 日志配置或日志器实例                       |
-| `fail_fast`  | `bool`                                 | `True`       | 任意节点出错时立即停止整条流水线           |
-| `ordered`    | `bool`                                 | `False`      | 结果按 item 提交顺序排列（有轻微额外开销） |
-
+| 参数              | 类型                                   | 默认値       | 说明                                       |
+| -------------- | -------------------------------------- | ------------ | ------------------------------------------ |
+| `name`         | `str`                                  | `"pipeline"` | 流水线名称，用于日志标识                   |
+| `context`      | `Context` \| `None`                    | `None`       | 预初始化的 root Context；不传时自动创建    |
+| `fail_fast`    | `bool`                                 | `True`       | 任意节点出错时立即停止整条流水线           |
+| `ordered`      | `bool`                                 | `False`      | 结果按 item 提交顺序排列（有轻微额外开销） |
+| `timeout_grace`| `float`                                | `5.0`        | 超时触发后等待 collector 完成的宽限时间（秒）  |
+| `storage`      | `RunStorageBackend` \| `None`          | `None`       | 自定义存储后端；不传时使用 `InMemoryStorage` |
+| `max_runs`     | `int`                                  | `100`        | 默认内存存储最大保留的运行条数（LRU）     |
 ### 示例
 
 ```python
@@ -49,10 +52,7 @@ import rivus
 p = rivus.Pipeline("my_pipeline")
 
 # 带日志配置
-p = rivus.Pipeline(
-    "classify",
-    log_config=rivus.LogConfig(level="DEBUG", to_file="run.log"),
-)
+p = rivus.Pipeline("classify")
 
 # 带预初始化 Context（共享模型等）
 ctx = rivus.Context({"model": MyModel(), "threshold": 0.5})
@@ -120,11 +120,10 @@ pipeline = rivus.Pipeline("ml-pipeline") | load_model | process | aggregate
 def setup(ctx: rivus.Context):
     # 首次运行前执行，适合连接数据库、加载配置等
     ctx.set("db", create_db_pool())
-    ctx.log.info("初始化完成")
 
 @pipeline.on_start
 def on_start(ctx: rivus.Context):
-    ctx.log.info("开始新一轮运行")
+    pass
 
 @pipeline.on_end
 def on_end(report: rivus.PipelineReport):
@@ -307,6 +306,12 @@ root Context 实例。
 
 最近一次运行的报告，运行中时为 `None`。
 
+### `storage → RunStorage`
+
+管理所有历史 run 的存储接口。详见下方 [RunStorage](#runstorage-历史运行管理) 章节。
+
+最近一次运行的报告，运行中时为 `None`。
+
 ---
 
 ## `PipelineStatus` 常量类
@@ -334,12 +339,24 @@ class PipelineReport:
     pipeline_name: str
     status: str
     total_duration_s: float
-    results: list[Any]         # 每个 item 最终的 ctx.get("input") 值
-    contexts: list[Context]    # 每个 item 的最终 Context
+    run_id: str              # UUID4，本次运行的唯一标识符
+    results: list[Any]      # 每个 item 最终的 ctx.get("input") 値
     errors: list[BaseException]
     nodes: list[NodeReport]
 ```
 
+### 属性
+
+| 属性               | 类型                  | 说明                                         |
+| ------------------ | --------------------- | -------------------------------------------- |
+| `pipeline_name`    | `str`                 | 流水线名称                                   |
+| `run_id`           | `str`                 | 本次运行的 UUID4，可用于 `pipeline.storage.get()` |
+| `status`           | `str`                 | 最终状态                                     |
+| `total_duration_s` | `float`               | 总执行时长（秒）                             |
+| `results`          | `list`                | 每个 item 的最终 `input` 値                  |
+| `errors`           | `list[BaseException]` | 所有节点错误列表                             |
+| `nodes`            | `list[NodeReport]`    | 每个节点的运行统计                           |
+| `succeeded`        | `bool`（属性）        | `status == "success"`                        |
 ### 属性
 
 | 属性               | 类型                  | 说明                                         |
@@ -367,19 +384,17 @@ report.values("score")     # 取每个 item 的 "score" 字段
 ### 示例
 
 ```python
+```python
 report = pipeline.run(*items)
 
 print(f"状态: {report.status}")
+print(f"run_id: {report.run_id}")
 print(f"耗时: {report.total_duration_s:.2f}s")
 print(f"结果: {report.results}")
 
 if not report.succeeded:
     for err in report.errors:
         print(f"错误: {err}")
-
-# 访问中间数据
-for ctx in report.contexts:
-    print(ctx.get("intermediate_result"))
 
 # 节点统计
 for nr in report.nodes:
@@ -494,3 +509,92 @@ submit_queue → relay₀ → [worker_A₁, worker_A₂] → q_out_A
                                                                                     ↓
                                                                              collector → PipelineReport
 ```
+## `RunStorage` 历史运行管理
+
+Pipeline 的 `storage` 属性返回一个 `RunStorage` 实例，它封装了存储后端，对外暴露历史 run 的管理 API。
+
+每次 `run()` / `run_background()` / `start()` 都会自动：
+1. 生成唯一 `run_id`（UUID4）
+2. 创建独立的 `_RunState`，存入 `storage`
+3. `PipelineReport` 携带对应 `run_id`
+
+### `pipeline.storage` API
+
+| 方法 / 操作符 | 说明 |
+| --- | --- |
+| `storage.get(run_id)` | 返回对应 `_RunState`，不存在则 `None` |
+| `storage.list()` | 返回所有 `run_id` 列表（oldest → newest） |
+| `storage.clear()` | 清空所有历史 run |
+| `storage[run_id]` | 等价 `get()`，不存在则抛 `KeyError` |
+| `run_id in storage` | 判断 run_id 是否存在 |
+| `len(storage)` | 已存储的 run 数量 |
+
+### 使用示例
+
+```python
+# 多次运行，每次得到独立的 run_id
+report1 = pipeline.run("hello")
+report2 = pipeline.run("world")
+
+print(report1.run_id)   # 'a1b2c3d4-...'
+print(report2.run_id)   # 'e5f6g7h8-...'  (不同)
+
+# 列出所有历史运行
+for rid in pipeline.storage.list():
+    state = pipeline.storage.get(rid)
+    print(rid, state.report.status, len(state.report.results))
+
+# 用下标查询
+state = pipeline.storage[report1.run_id]
+print(state.report.results)
+
+# 判断 run_id 是否存在
+if report1.run_id in pipeline.storage:
+    print("found")
+
+print(len(pipeline.storage))   # 2
+
+# 清空历史
+pipeline.storage.clear()
+print(len(pipeline.storage))   # 0
+```
+
+### LRU 容量限制
+
+默认 `max_runs=100`，超过限制后自动淘汰最旧的 run：
+
+```python
+# 只保留最近 10 条运行记录
+pipeline = rivus.Pipeline("my_pipeline", max_runs=10)
+```
+
+### 自定义存储后端
+
+继承 `RunStorageBackend` 可实现任意存储层（SQLite、Redis、云存储等）：
+
+```python
+import rivus
+
+class RedisStorage(rivus.RunStorageBackend):
+    def __init__(self, client, prefix="rivus:"):
+        self._r = client
+        self._prefix = prefix
+
+    def save(self, run_id, state):
+        # 序列化存入 Redis…
+        ...
+
+    def get(self, run_id):
+        # 从 Redis 取回并反序列化…
+        ...
+
+    def list(self):
+        # 返回所有 run_id…
+        ...
+
+    def clear(self):
+        ...
+
+pipeline = rivus.Pipeline("prod", storage=RedisStorage(redis_client))
+```
+

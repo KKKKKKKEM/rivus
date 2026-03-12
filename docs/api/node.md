@@ -148,7 +148,6 @@ def filter_node(ctx: Context):
 ```python
 @node(once=True)
 def load_config(ctx: Context):
-    ctx.log.info("加载配置（只执行一次）")
     ctx.set("config", load_from_disk())
     return ctx.get("input")   # pass-through
 ```
