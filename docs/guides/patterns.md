@@ -1,694 +1,520 @@
-# 使用模式与最佳实践
+# 高级使用模式
 
-本文档整理了 Rivus 中常见的设计模式与使用技巧。
-
----
-
-## 目录
-
-- [基础模式](#基础模式)
-  - [线性流水线](#线性流水线)
-  - [并发 I/O 密集型](#并发-io-密集型)
-  - [CPU 密集型（进程模式）](#cpu-密集型进程模式)
-- [数据流模式](#数据流模式)
-  - [Fan-out：一变多](#fan-out一变多)
-  - [Gather：多合一](#gather多合一)
-  - [Fan-out + Gather：分散-聚合](#fan-out--gather分散-聚合)
-- [初始化模式](#初始化模式)
-  - [共享模型/配置](#共享模型配置)
-  - [per-worker 初始化（BaseNode.setup）](#per-worker-初始化basenodesetup)
-  - [Once 节点（生命周期内只执行一次）](#once-节点生命周期内只执行一次)
-  - [Pipeline 生命周期钩子](#pipeline-生命周期钩子)
-- [流控模式](#流控模式)
-  - [NodeSkip：过滤/丢弃 item](#nodeskip过滤丢弃-item)
-  - [背压控制（queue_size）](#背压控制queue_size)
-  - [优雅停止](#优雅停止)
-  - [超时保护](#超时保护)
-- [结果处理模式](#结果处理模式)
-  - [有序结果](#有序结果)
-  - [访问中间数据](#访问中间数据)
-  - [容错收集（fail_fast=False）](#容错收集fail_fastfalse)
-- [流式模式](#流式模式)
-  - [持续数据流](#持续数据流)
-  - [后台运行 + 超时监控](#后台运行--超时监控)
-- [高级模式](#高级模式)
-  - [Dynamic context 传递](#dynamic-context-传递)
-  - [节内协作式停止](#节内协作式停止)
-  - [多阶段 RAG 流水线](#多阶段-rag-流水线)
+本文档收录 Rivus 的高级使用模式，涵盖数据流控制、并发调优、生命周期管理等场景。
 
 ---
 
-## 基础模式
+## 1. 扇出（Fan-out）
 
-### 线性流水线
+### 基础扇出
 
-最基本的串行处理形式：每个节点依次处理上游产出。
-
-```python
-import rivus
-
-@rivus.node
-def load(ctx: rivus.Context):
-    path = ctx.require("input")
-    return open(path).read()
-
-@rivus.node
-def parse(ctx: rivus.Context):
-    text = ctx.require("input")
-    return {"words": text.split(), "length": len(text)}
-
-@rivus.node
-def store(ctx: rivus.Context):
-    data = ctx.require("input")
-    database.insert(data)
-    # 返回 None → pass-through，ctx 原样传下游（副作用节点）
-
-pipeline = rivus.Pipeline("etl") | load | parse | store
-report = pipeline.run("file1.txt", "file2.txt", "file3.txt")
-```
-
-### 并发 I/O 密集型
-
-网络请求、数据库查询等 I/O 密集任务，用多线程提高吞吐量：
-
-```python
-import requests
-import rivus
-
-@rivus.node(workers=16)          # 16 线程并发
-def fetch(ctx: rivus.Context):
-    url = ctx.require("input")
-    resp = requests.get(url, timeout=10)
-    resp.raise_for_status()
-    return resp.json()
-
-@rivus.node(workers=4)
-def extract(ctx: rivus.Context):
-    data = ctx.require("input")
-    return {"title": data["title"], "content": data["body"]}
-
-pipeline = rivus.Pipeline("crawler") | fetch | extract
-report = pipeline.run(*urls)
-```
-
-### CPU 密集型（进程模式）
-
-数值计算、图像处理等 CPU 密集任务，绕过 GIL：
-
-```python
-import rivus
-
-# 注意：进程模式函数必须是模块级，不能是 lambda 或闭包
-def resize_image(ctx: rivus.Context):
-    from PIL import Image
-    path = ctx.require("input")
-    img = Image.open(path)
-    return img.resize((224, 224))
-
-resize_node = rivus.Node(
-    resize_image,
-    name="Resize",
-    workers=4,
-    concurrency_type="process",  # 多进程，绕过 GIL
-)
-
-pipeline = rivus.Pipeline("vision") | resize_node
-report = pipeline.run(*image_paths)
-```
-
----
-
-## 数据流模式
-
-### Fan-out：一变多
-
-一条记录展开为多条下游记录：
+一个节点产生多个输出，下游并发处理：
 
 ```python
 import rivus
 
 @rivus.node
-def split_document(ctx: rivus.Context):
-    """将文档拆分为段落"""
-    doc = ctx.require("input")
-    for para in doc.split("\n\n"):
-        para = para.strip()
-        if para:
-            yield para           # 每个段落作为独立 item
-
-@rivus.node(workers=8)
-def embed_paragraph(ctx: rivus.Context):
-    """向量化每个段落"""
-    para = ctx.require("input")
-    return embedding_model.encode(para)
-
-pipeline = rivus.Pipeline("index") | split_document | embed_paragraph
-report = pipeline.run(*documents)    # 10 篇文档 → N 个段落 → N 个向量
-```
-
-### Gather：多合一
-
-等待所有上游并发结果，合并后统一处理：
-
-```python
-import rivus
-
-@rivus.node(workers=8)
-def score_item(ctx: rivus.Context):
-    item = ctx.require("input")
-    return {"id": item["id"], "score": model.score(item)}
-
-@rivus.node(gather=True)
-def rank_and_store(ctx: rivus.Context):
-    """等所有评分完成后，统一排序写入"""
-    scored = ctx.require("input")          # list of dicts
-    ranked = sorted(scored, key=lambda x: x["score"], reverse=True)
-    database.batch_insert(ranked)
-    return len(ranked)
-
-pipeline = rivus.Pipeline("ranking") | score_item | rank_and_store
-report = pipeline.run(*candidates)
-```
-
-### Fan-out + Gather：分散-聚合
-
-经典的 map-reduce 模式：
-
-```python
-import rivus
-
-@rivus.node
-def split(ctx: rivus.Context):
-    """将批次拆分为单条"""
-    batch = ctx.require("input")
+def split_batch(ctx: rivus.Context):
+    """将一个批次拆分为独立 item"""
+    batch = ctx.require("input")  # 输入：[item1, item2, ...]
     for item in batch:
         yield item
 
+@rivus.node(workers=4)
+def process_item(ctx: rivus.Context):
+    item = ctx.require("input")
+    return expensive_operation(item)
+
+pipeline = rivus.Pipeline("fan-out") | split_batch | process_item
+
+# 输入 1 个列表，输出多个结果
+results = pipeline.run([1, 2, 3, 4, 5])
+print(len(results))  # 5（顺序不保证）
+```
+
+### 多级扇出
+
+```python
+@rivus.node
+def level1(ctx: rivus.Context):
+    for category in ctx.require("input"):
+        yield category  # 5 个类别
+
+@rivus.node
+def level2(ctx: rivus.Context):
+    category = ctx.require("input")
+    for item in get_items(category):
+        yield item      # 每个类别下 N 个 item
+
 @rivus.node(workers=8)
 def process(ctx: rivus.Context):
-    return heavy_compute(ctx.require("input"))
+    return transform(ctx.require("input"))
 
-@rivus.node(gather=True)
-def aggregate(ctx: rivus.Context):
-    """汇总所有结果"""
-    results = ctx.require("input")    # list
-    return {"count": len(results), "total": sum(r["score"] for r in results)}
-
-pipeline = rivus.Pipeline("map_reduce") | split | process | aggregate
-report = pipeline.run(*batches)
+# 1 个输入 → 5 × N 个输出，全程并发
+pipeline = rivus.Pipeline("multi-fan-out") | level1 | level2 | process
 ```
 
 ---
 
-## 初始化模式
+## 2. 数据过滤（SKIP 信号）
 
-### 共享模型/配置
-
-通过 `initial=` 向所有节点注入共享数据（模型、配置、数据库连接等）：
+### 基础过滤
 
 ```python
-import rivus
-
-@rivus.node(workers=4)
-def inference(ctx: rivus.Context):
-    model = ctx.require("model")        # 从共享 Context 读取
-    tokenizer = ctx.require("tokenizer")
-    text = ctx.require("input")
-    tokens = tokenizer.encode(text)
-    return model.generate(tokens)
-
-model = load_model("bert-base")
-tokenizer = load_tokenizer("bert-base")
-
-pipeline = rivus.Pipeline("nlp") | inference
-report = pipeline.run(
-    *texts,
-    initial={"model": model, "tokenizer": tokenizer}
-)
-```
-
-或通过预初始化 Context：
-
-```python
-ctx = rivus.Context({
-    "model": load_model("resnet50"),
-    "threshold": 0.8,
-    "labels": LABEL_MAP,
-})
-pipeline = rivus.Pipeline("classify", context=ctx) | preprocess | inference | postprocess
-```
-
-### per-worker 初始化（BaseNode.setup）
-
-`setup()` 在流水线启动时调用**一次**，所有 workers 共享同一个 `BaseNode` 实例，因此 `setup()` 中初始化的资源被所有 workers 共享。
-
-```python
-import rivus
-
-class InferenceNode(rivus.BaseNode):
-    workers = 4
-    name = "Inference"
-
-    def setup(self, ctx: rivus.Context) -> None:
-        """每次 pipeline.run() 前调用一次，初始化共享资源"""
-        model_path = ctx.require("model_path")
-        self.model = ModelLoader.load(model_path)
-        self.threshold = ctx.get("threshold", 0.5)
-
-    def process(self, ctx: rivus.Context):
-        data = ctx.require("input")
-        score = self.model.predict(data)
-        return {"data": data, "score": score, "label": score > self.threshold}
-
-pipeline = rivus.Pipeline("classify") | InferenceNode()
-report = pipeline.run(*items, initial={"model_path": "/models/v2.pt"})
-```
-
-> **注意**：多 worker 并发调用 `process()` 时，若 `self.model` 非线程安全，需加锁或为每个 worker 创建独立模型实例（在 setup 中初始化 `self._lock = threading.Lock()`）。
-
-### Once 节点（生命周期内只执行一次）
-
-`once=True` 让节点在整个 **Pipeline 对象生命周期**内只执行一次。首次 `run()` 正常执行，后续 `run()` 直接透传 item。
-
-适合：模型加载、数据库连接建立、配置文件读取等**幂等且昂贵**的初始化操作。
-
-```python
-import rivus
-
-@rivus.node(once=True)
-def load_model(ctx: rivus.Context):
-    ctx.set("model", Model.load(ctx.require("model_path")))
-    return ctx.get("input")   # pass-through，让 input 继续流转
-
-@rivus.node(workers=4)
-def infer(ctx: rivus.Context):
-    model = ctx.require("model")
-    return model.predict(ctx.require("input"))
-
-pipeline = rivus.Pipeline("ml") | load_model | infer
-
-report1 = pipeline.run(*batch1, initial={"model_path": "/models/v2.pt"})
-# load_model 已执行，model 存在 ctx 中
-report2 = pipeline.run(*batch2)   # load_model 跳过，直接推理
-```
-
-### Pipeline 生命周期钩子
-
-生命周期钩子让你在 Pipeline 运行的不同阶段插入逻辑，而无需修改任何节点。
-
-| 钩子         | 触发时机                                |
-| ------------ | --------------------------------------- |
-| `on_init`    | 整个生命周期第一次 `run()` 前（仅一次） |
-| `on_start`   | 每次 `run()` / `start()` 开始时         |
-| `on_end`     | 每次运行**成功**后                      |
-| `on_failure` | 每次运行**失败**后                      |
-
-```python
-import rivus
-
-pipeline = rivus.Pipeline("etl") | extract | transform | load
-
-@pipeline.on_init
-def setup_resources(ctx: rivus.Context):
-    ctx.set("db", create_connection_pool())
-    ctx.set("cache", RedisCache())
-
-@pipeline.on_start
-def log_start(ctx: rivus.Context):
-    pass
-
-@pipeline.on_end
-def cleanup(report: rivus.PipelineReport):
-    print(f"完成：{len(report.results)} 条，耗时 {report.total_duration_s:.2f}s")
-
-@pipeline.on_failure
-def alert_on_failure(report: rivus.PipelineReport):
-    for err in report.errors:
-        send_alert(str(err))
-
-# on_init 在首次 run() 前触发
-report1 = pipeline.run(*batch1)
-# on_init 不再触发，on_start/on_end 依然触发
-report2 = pipeline.run(*batch2)
-```
-
----
-
-## 流控模式
-
-### NodeSkip：过滤/丢弃 item
-
-在节点内 `raise NodeSkip()` 可以**静默丢弃当前 item**，不产生错误，item 不会流向下游。
-
-```python
-import rivus
+from rivus import signals
 
 @rivus.node
-def filter_quality(ctx: rivus.Context):
+def validate(ctx: rivus.Context):
     item = ctx.require("input")
-    if item.get("quality_score", 0) < 0.7:
-        raise rivus.NodeSkip(f"低质量 item 已过滤: score={item['quality_score']}")
+    if not is_valid(item):
+        raise signals.SKIP  # 丢弃，不传下游
     return item
 
-@rivus.node(workers=4)
-def process_high_quality(ctx: rivus.Context):
-    # 只有 quality_score >= 0.7 的 item 才会到达这里
-    return enrich(ctx.require("input"))
-
-pipeline = rivus.Pipeline("quality-filter") | filter_quality | process_high_quality
-report = pipeline.run(*raw_items)
-
-# 查看跳过数量
-filter_report = report.nodes[0]
-print(f"过滤掉 {filter_report.items_skipped}/{filter_report.items_in} 条低质量 item")
-```
-
-`NodeSkip` 可以在流水线任意节点使用，不影响其他 item 的处理：
-
-```python
 @rivus.node
-def enrich(ctx: rivus.Context):
+def filter_empty(ctx: rivus.Context):
     item = ctx.require("input")
-    try:
-        extra = fetch_extra_info(item["id"])
-    except NotFoundError:
-        raise rivus.NodeSkip(f"id={item['id']} 无额外信息，跳过")
-    return {**item, **extra}
+    if item is None or item == "":
+        raise signals.SKIP
+    return item.strip()
 ```
 
-### 背压控制（queue_size）
+### 条件路由（过滤 + 多管道）
 
-当下游节点处理速度远低于上游时，设置 `queue_size` 防止内存无限增长：
-
-```python
-import rivus
-
-@rivus.node(workers=16)     # 快速抓取
-def fast_fetch(ctx: rivus.Context):
-    return requests.get(ctx.require("input")).content
-
-@rivus.node(workers=2, queue_size=50)   # 慢速处理，队列上限 50
-def slow_process(ctx: rivus.Context):
-    data = ctx.require("input")
-    return heavy_image_processing(data)
-
-pipeline = rivus.Pipeline("pipeline") | fast_fetch | slow_process
-```
-
-当 `slow_process` 的输入队列达到 50 时，`fast_fetch` 的输出会阻塞，形成自然的背压。
-
-### 优雅停止
-
-**方式一：`ctx.stop()` — 立即停止当前节点**
+由于 Rivus 是线性管道，条件路由可通过过滤器配合多条 Pipeline 实现：
 
 ```python
-@rivus.node
-def check_termination(ctx: rivus.Context):
-    item = ctx.require("input")
-    if item.get("type") == "EOF":
-        ctx.stop("received EOF signal")   # 立即终止
-    return process(item)
-```
+from rivus import signals
 
-**方式二：`ctx.request_stop()` + `ctx.stop_requested` — 协作式退出**
+def make_type_filter(target_type: str):
+    """生成只处理特定类型的过滤节点"""
+    @rivus.node(name=f"filter-{target_type}")
+    def _filter(ctx: rivus.Context):
+        item = ctx.require("input")
+        if item.get("type") != target_type:
+            raise signals.SKIP
+        return item
+    return _filter
 
-```python
-@rivus.node(workers=4)
-def process_with_early_exit(ctx: rivus.Context):
-    data = ctx.require("input")
-    results = []
-    for chunk in data.chunks():
-        if ctx.stop_requested:     # 轮询停止标志
-            print("early exit due to stop request")
-            break
-        results.append(process_chunk(chunk))
-    return results
-```
+# 两条专用管道
+text_pipeline = rivus.Pipeline("text") | make_type_filter("text") | process_text
+image_pipeline = rivus.Pipeline("image") | make_type_filter("image") | process_image
 
-**方式三：外部调用 `pipeline.stop()`**
-
-```python
-import threading, rivus
-
-pipeline = rivus.Pipeline("long_run") | heavy_node
-
-def _timeout_watcher():
-    time.sleep(30)
-    pipeline.stop()
-
-threading.Thread(target=_timeout_watcher, daemon=True).start()
-pipeline.run_background(*items)
-report = pipeline.wait()
-```
-
-### 超时保护
-
-最简单的超时写法：
-
-```python
-try:
-    report = pipeline.run(*items, timeout=60.0)
-except rivus.PipelineTimeoutError:
-    print("超时，任务未完成")
-```
-
-后台模式超时：
-
-```python
-pipeline.run_background(*items, timeout=30.0)
-report = pipeline.wait()   # 超时后 report.status == "timeout"
+# 根据 item 类型路由
+def route(item):
+    if item.get("type") == "text":
+        return text_pipeline.run(item)
+    return image_pipeline.run(item)
 ```
 
 ---
 
-## 结果处理模式
+## 3. 优雅停止
 
-### 有序结果
-
-```python
-pipeline = rivus.Pipeline("ordered", ordered=True) | process_node
-report = pipeline.run(*items)
-# report.results 保证与 items 顺序一致
-for item, result in zip(items, report.results):
-    print(f"{item} → {result}")
-```
-
-### 访问中间数据
-
-每个 item 的最终 `Context` 保存了整条派生链上所有节点写入的数据：
+### STOP 信号（节点主动停止）
 
 ```python
-@rivus.node
-def stage1(ctx: rivus.Context):
-    result = compute_stage1(ctx.require("input"))
-    ctx.set("stage1_result", result)   # 显式保存中间数据
-    return result
+from rivus import signals
 
 @rivus.node
-def stage2(ctx: rivus.Context):
-    result = compute_stage2(ctx.require("input"))
-    ctx.set("stage2_result", result)
-    return result
-
-pipeline = rivus.Pipeline("multi_stage") | stage1 | stage2
-report = pipeline.run(*items)
-
-for final_ctx in report.contexts:
-    print(final_ctx.get("stage1_result"))   # 访问中间结果
-    print(final_ctx.get("stage2_result"))
-    print(final_ctx.get("input"))           # 最终输出
-```
-
-> **注意**：`ctx.set()` 写入的是**当前 item 的 Context**，不影响其他 item 的 Context。
-
-### 容错收集（fail_fast=False）
-
-处理部分失败的场景（如爬虫，允许少量失败）：
-
-```python
-import rivus
-
-@rivus.node(workers=8)
-def fetch_url(ctx: rivus.Context):
-    url = ctx.require("input")
-    resp = requests.get(url, timeout=5)
-    resp.raise_for_status()
-    return resp.json()
-
-pipeline = rivus.Pipeline("crawler", fail_fast=False) | fetch_url
-report = pipeline.run(*urls)
-
-success_results = [r for r in report.results if r is not None]
-failed_count = len(report.errors)
-print(f"成功 {len(success_results)}/{len(urls)}，失败 {failed_count}")
-
-for err in report.errors:
-    if isinstance(err, rivus.NodeError):
-        print(f"  节点 {err.node_name}: {err.cause}")
-```
-
----
-
-## 流式模式
-
-### 持续数据流
-
-```python
-import rivus
-from kafka import KafkaConsumer
-
-@rivus.node(workers=4)
-def process_message(ctx: rivus.Context):
-    msg = ctx.require("input")
-    return transform(msg.value)
-
-@rivus.node
-def write_to_db(ctx: rivus.Context):
-    database.insert(ctx.require("input"))
-
-pipeline = rivus.Pipeline("kafka_consumer") | process_message | write_to_db
-pipeline.start()
-
-consumer = KafkaConsumer("my_topic")
-try:
-    for msg in consumer:
-        pipeline.submit(msg)
-except KeyboardInterrupt:
-    pass
-finally:
-    pipeline.close()
-    report = pipeline.wait(timeout=30)
-    print(f"处理了 {len(report.results)} 条消息")
-```
-
-### 后台运行 + 超时监控
-
-```python
-import rivus
-
-pipeline = rivus.Pipeline("background_task", fail_fast=False) | step1 | step2
-pipeline.run_background(*large_dataset, timeout=300)
-
-# 主线程做其他工作
-while pipeline.is_running:
-    time.sleep(5)
-    print(f"状态: {pipeline.status}")
-
-report = pipeline.wait()
-print(f"完成: {report.status}, 耗时: {report.total_duration_s:.1f}s")
-```
-
----
-
-## 高级模式
-
-### Dynamic context 传递
-
-节点可以直接返回 `Context` 实例，完全控制传递给下游的数据：
-
-```python
-@rivus.node
-def enrich(ctx: rivus.Context):
+def poison_pill_detector(ctx: rivus.Context):
     item = ctx.require("input")
-    # 手动 derive，可自定义键名
-    return ctx.derive(
-        input=item["data"],
-        metadata=item["meta"],
-        timestamp=time.time(),
-    )
+    if item == "STOP":
+        raise signals.STOP  # 终止整条流水线
+    return item
+
+pipeline = rivus.Pipeline("demo") | poison_pill_detector | process
+pipeline.run("item1")   # 正常处理
+pipeline.run("STOP")    # 触发停止（注意：run() 仍会返回，但流水线不再继续）
 ```
 
-### 节内协作式停止
+### ctx.cancel()（外部取消）
 
-满足某个外部条件时，从另一个线程发出停止信号：
+适用于 HTTP 服务层或超时场景：
 
 ```python
 import threading
 import rivus
 
-pipeline = rivus.Pipeline("conditional") | node_a | node_b
-
-stop_flag = threading.Event()
-
 @rivus.node(workers=4)
-def process(ctx: rivus.Context):
-    if stop_flag.is_set():
-        ctx.stop("external stop signal received")
-    return ctx.require("input") * 2
+def slow_step(ctx: rivus.Context):
+    item = ctx.require("input")
+    time.sleep(10)  # 模拟慢操作
+    return item
 
-# 外部条件触发停止
-def external_monitor():
-    wait_for_external_condition()
-    stop_flag.set()
+pipeline = rivus.Pipeline("demo") | slow_step
+ctx = pipeline.make_context(input="data")
 
-threading.Thread(target=external_monitor, daemon=True).start()
-report = pipeline.run(*items)
+# 在另一个线程中取消
+def cancel_after(seconds):
+    time.sleep(seconds)
+    ctx.cancel()
+
+threading.Thread(target=cancel_after, args=(2,), daemon=True).start()
+
+# run() 接受已构造的 Context
+results = pipeline.run(ctx)  # 2 秒后被取消
 ```
 
-### 多阶段 RAG 流水线
-
-综合运用 fan-out、gather、并发模式的完整示例：
+### 超时控制
 
 ```python
-import rivus
+from rivus.node import Node  # TimeoutError
 
-class EmbedNode(rivus.BaseNode):
-    workers = 8
-    name = "Embed"
-
-    def setup(self, ctx: rivus.Context) -> None:
-        self.embed_model = load_embedding_model(ctx.require("embed_model"))
-
-    def process(self, ctx: rivus.Context):
-        text = ctx.require("input")
-        return {"text": text, "vector": self.embed_model.encode(text)}
-
-
-@rivus.node
-def chunk_document(ctx: rivus.Context):
-    """文档 → 多个 chunk（fan-out）"""
-    doc = ctx.require("input")
-    for chunk in split_into_chunks(doc, max_tokens=512):
-        yield chunk
-
-
-@rivus.node(gather=True)
-def build_index(ctx: rivus.Context):
-    """所有 chunk 向量化完成后，统一构建索引"""
-    embeddings = ctx.require("input")   # list of {"text": ..., "vector": ...}
-    index = VectorIndex()
-    for item in embeddings:
-        index.add(item["vector"], item["text"])
-    index.save("index.faiss")
-    return len(embeddings)
-
-
-pipeline = (
-    rivus.Pipeline("rag_indexer")
-    | chunk_document
-    | EmbedNode()
-    | build_index
-)
-
-report = pipeline.run(
-    *documents,
-    initial={"embed_model": "text-embedding-ada-002"},
-    timeout=600,
-)
-print(f"索引完成，共 {report.results[0]} 个 chunk")
+try:
+    results = pipeline.run("data", timeout=30.0)
+except TimeoutError:
+    print("Pipeline timed out!")
 ```
 
 ---
 
-## 性能调优建议
+## 4. Gather 屏障（汇聚模式）
 
-| 场景                    | 建议                                              |
-| ----------------------- | ------------------------------------------------- |
-| I/O 密集型（HTTP/DB）   | `workers=16~64`，`concurrency_type="thread"`      |
-| CPU 密集型（图像/数值） | `workers=CPU核数`，`concurrency_type="process"`   |
-| 下游明显慢于上游        | 给慢速节点设置 `queue_size`，防止内存溢出         |
-| 需要保持顺序            | `Pipeline(ordered=True)`（有轻微开销）            |
-| 允许部分失败            | `fail_fast=False`                                 |
-| 需要全量结果才能继续    | 下游节点加 `gather=True`                          |
-| 长时间任务              | 设置 `timeout`，或节点内轮询 `ctx.stop_requested` |
-| 节点间数据量大          | 考虑传递数据引用（如文件路径）而非数据本身        |
+> **注意**：当前版本（0.4.0）的 `@node` 装饰器不直接支持 `gather=True` 参数（README 中提及，但实现中需手动实现 gather 逻辑）。以下展示如何用框架现有能力模拟 gather 行为。
+
+### 手动 Gather 模式
+
+使用 `stream()` 收集所有上游结果，再统一处理：
+
+```python
+import rivus
+
+@rivus.node(workers=4)
+def scatter(ctx: rivus.Context):
+    """并发处理，每条独立输出"""
+    n = ctx.require("input")
+    return n * n
+
+# 先跑 scatter 阶段
+scatter_pipeline = rivus.Pipeline("scatter") | scatter
+
+# 收集所有结果
+def scatter_then_reduce(items: list, reduce_fn):
+    scatter_results = []
+    for item in items:
+        results = scatter_pipeline.run(item)
+        scatter_results.extend(results)
+    return reduce_fn(scatter_results)
+
+# 使用
+total = scatter_then_reduce([1, 2, 3, 4, 5], sum)
+print(total)  # 1+4+9+16+25 = 55
+```
+
+### 使用扇出 + 最终节点汇聚
+
+```python
+@rivus.node
+def split(ctx: rivus.Context):
+    for item in ctx.require("input"):
+        yield item
+
+@rivus.node(workers=4)
+def transform(ctx: rivus.Context):
+    return process(ctx.require("input"))
+
+# 注意：所有结果由 pipeline.run() 统一收集后返回
+pipeline = rivus.Pipeline("scatter-gather") | split | transform
+results = pipeline.run([1, 2, 3, 4, 5])
+total = sum(results)  # 在 run() 返回后汇聚
+```
+
+---
+
+## 5. 并发调优
+
+### 节点并发度设置原则
+
+```
+                    节点类型
+┌─────────────────┬──────────────────────────────────────┐
+│ I/O 密集型      │ workers = CPU 核数 × 2 ~ 10          │
+│（网络、数据库）  │ 示例：@node(workers=8)               │
+├─────────────────┼──────────────────────────────────────┤
+│ CPU 密集型      │ workers = CPU 核数（超了反而更慢）    │
+│（计算、加密）   │ 示例：@node(workers=4)               │
+├─────────────────┼──────────────────────────────────────┤
+│ 顺序敏感型      │ workers = 1（默认）                  │
+│（写日志、排序） │ 示例：@node                          │
+└─────────────────┴──────────────────────────────────────┘
+```
+
+### 瓶颈节点识别
+
+通过在节点内记录耗时，找出瓶颈：
+
+```python
+import time
+import rivus
+
+@rivus.node(workers=4)
+def maybe_bottleneck(ctx: rivus.Context):
+    t0 = time.time()
+    result = slow_operation(ctx.require("input"))
+    elapsed = time.time() - t0
+    if elapsed > 1.0:
+        print(f"SLOW: {elapsed:.2f}s")  # 找出慢项目
+    return result
+```
+
+### 背压控制（queue_size）
+
+当下游处理速度慢于上游时，使用 `queue_size` 限制队列长度，阻塞上游避免内存爆炸：
+
+```python
+@rivus.node(workers=1)           # 快速生产者
+def producer(ctx: rivus.Context):
+    for chunk in read_large_file(ctx.require("input")):
+        yield chunk
+
+@rivus.node(workers=2, queue_size=50)  # 慢速消费者，队列满时上游阻塞
+def consumer(ctx: rivus.Context):
+    return upload_to_s3(ctx.require("input"))
+
+pipeline = rivus.Pipeline("pipeline") | producer | consumer
+```
+
+### Pipeline 并发限制
+
+`max_workers` 控制同时运行的 `run()` 调用数量：
+
+```python
+# 适合高 QPS HTTP 服务场景
+pipeline = rivus.Pipeline("api", max_workers=50)
+
+# CPU 密集型场景，限制并发避免过载
+pipeline = rivus.Pipeline("cpu-heavy", max_workers=4)
+
+# 无限制（适合控制量很小的场景）
+pipeline = rivus.Pipeline("unlimited", max_workers=None)
+```
+
+---
+
+## 6. 生命周期钩子高级用法
+
+### 连接池模式
+
+```python
+import rivus
+from contextlib import contextmanager
+
+pipeline = rivus.Pipeline("db-pipeline", max_workers=20)
+
+# startup：初始化连接池（只执行一次）
+@pipeline.on_startup
+def init_pool(p: rivus.Pipeline):
+    pool = create_connection_pool(max_size=20)
+    p.set("db_pool", pool)
+
+# run_start：从连接池借用连接
+@pipeline.on_run_start
+def acquire_conn(ctx: rivus.Context):
+    pool = ctx.get("pipeline").get("db_pool")
+    conn = pool.acquire()
+    ctx.set("db", conn)
+
+# run_end：归还连接到池
+@pipeline.on_run_end
+def release_conn(ctx: rivus.Context):
+    pool = ctx.get("pipeline").get("db_pool")
+    conn = ctx.get("db")
+    if conn:
+        pool.release(conn)
+
+@rivus.node
+def query(ctx: rivus.Context):
+    db = ctx.require("db")
+    return db.query(ctx.require("input"))
+
+pipeline.add_node(query)
+```
+
+### 分布式追踪
+
+```python
+import uuid
+import time
+
+@pipeline.on_run_start
+def inject_trace(ctx: rivus.Context):
+    ctx.set("trace_id", str(uuid.uuid4()))
+    ctx.set("start_time", time.perf_counter())
+
+@pipeline.on_run_end
+def record_trace(ctx: rivus.Context):
+    trace_id = ctx.get("trace_id", "?")
+    elapsed = time.perf_counter() - ctx.get("start_time", 0)
+    send_to_jaeger(trace_id=trace_id, duration_ms=elapsed * 1000)
+```
+
+### 错误监控
+
+```python
+@pipeline.on_run_end
+def error_monitor(ctx: rivus.Context):
+    if ctx.error:
+        send_alert(
+            title="Pipeline error",
+            message=str(ctx.error),
+            pipeline=ctx.get("pipeline").name,
+        )
+```
+
+---
+
+## 7. 自定义结果提取
+
+通过 `on_result` 参数控制 `run()` 返回的内容：
+
+```python
+# 默认：返回 [ctx.input for ctx in results]
+pipeline = rivus.Pipeline("demo")
+
+# 返回完整 Context（适合需要访问元数据的场景）
+pipeline = rivus.Pipeline(
+    "demo",
+    on_result=lambda p, results, ctx: list(results)
+)
+
+# 过滤错误并提取 input
+pipeline = rivus.Pipeline(
+    "demo",
+    on_result=lambda p, results, ctx: [
+        r.input for r in results if r.error is None
+    ]
+)
+
+# 自定义聚合
+pipeline = rivus.Pipeline(
+    "sum-pipeline",
+    on_result=lambda p, results, ctx: [sum(r.input for r in results)]
+)
+```
+
+---
+
+## 8. 流水线组合
+
+### 串行组合（顺序执行多条流水线）
+
+```python
+import rivus
+
+pipeline_a = rivus.Pipeline("a") | step_a1 | step_a2
+pipeline_b = rivus.Pipeline("b") | step_b1 | step_b2
+
+# 手动串联
+items = ["item1", "item2", "item3"]
+intermediate = []
+for item in items:
+    intermediate.extend(pipeline_a.run(item))
+
+final = []
+for item in intermediate:
+    final.extend(pipeline_b.run(item))
+```
+
+### 并行处理同一批数据
+
+```python
+import concurrent.futures
+import rivus
+
+pipeline = rivus.Pipeline("parallel-runs", max_workers=10) | heavy_step
+
+items = list(range(100))
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    futures = {executor.submit(pipeline.run, item): item for item in items}
+    results = []
+    for future in concurrent.futures.as_completed(futures):
+        results.extend(future.result())
+```
+
+---
+
+## 9. 流式处理大数据集
+
+```python
+import rivus
+
+@rivus.node
+def read_chunk(ctx: rivus.Context):
+    """从文件读取一行"""
+    line = ctx.require("input")
+    return line.strip()
+
+@rivus.node(workers=4)
+def process_line(ctx: rivus.Context):
+    return transform(ctx.require("input"))
+
+pipeline = rivus.Pipeline("stream-proc") | read_chunk | process_line
+
+# 流式处理，内存占用低
+with open("large_file.txt") as f:
+    for line in f:
+        for ctx in pipeline.stream(line):
+            write_output(ctx.input)
+```
+
+---
+
+## 10. 调试技巧
+
+### 节点日志
+
+```python
+import rivus
+from loguru import logger
+
+@rivus.node(name="debug-step")
+def debug_step(ctx: rivus.Context):
+    item = ctx.require("input")
+    logger.debug(f"[{ctx._id}] Processing: {item!r}")
+    result = process(item)
+    logger.debug(f"[{ctx._id}] Result: {result!r}")
+    return result
+```
+
+### 单节点测试
+
+```python
+import rivus
+from rivus.context import Context
+
+# 直接测试节点函数，无需 Pipeline
+@rivus.node
+def my_step(ctx: rivus.Context):
+    return ctx.require("input").upper()
+
+# 手动构造 Context 测试
+ctx = Context(initial={"input": "hello"})
+result = my_step.fn(ctx)
+assert result == "HELLO"
+```
+
+### 检查中间结果
+
+```python
+import rivus
+
+results_at_step2 = []
+
+@rivus.node
+def checkpoint(ctx: rivus.Context):
+    """无侵入检查点，记录中间结果"""
+    item = ctx.require("input")
+    results_at_step2.append(item)   # 记录
+    return None                     # pass-through
+
+pipeline = (
+    rivus.Pipeline("debug")
+    | step1
+    | checkpoint   # 插入检查点
+    | step2
+    | step3
+)
+pipeline.run("test")
+print("After step1:", results_at_step2)
+```

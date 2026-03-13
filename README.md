@@ -15,7 +15,7 @@ items → wrap(ctx) → Q → [Node A, workers=W] → Q → [Node B, workers=W] 
 - **gather 屏障** — `gather=True` 将上游所有输出汇聚后再处理
 - **优雅停止** — 节点内调用 `ctx.stop()` 可安全终止流水线
 - **结构化报告** — 含耗时统计（min/max/avg/p50/p95）的 `PipelineReport`
-- **RunStorage** — 每次 `run()` 自动分配 `run_id`，所有历史运行状态可查可管理
+- **RunStorage** — 每次 `run()` 自动分配 `task_id`，所有历史运行状态可查可管理
 
 ## 安装
 
@@ -123,48 +123,48 @@ def cpu_bound(ctx: rivus.Context):
 
 ## API 参考
 
-| 类 / 函数 | 说明 |
-|---|---|
-| `@node` / `node(...)` | 将函数包装为节点 |
-| `BaseNode` | 类式节点基类，重写 `process(ctx)` |
-| `Pipeline(name)` | 创建流水线 |
-| `Pipeline \| node` | 添加节点 |
-| `Pipeline.run(*items)` | 同步运行，返回 `PipelineReport` |
-| `Pipeline.storage` | `RunStorage` 实例，管理所有历史运行状态 |
-| `Context` | item + 共享元数据容器 |
-| `PipelineReport` | 运行报告（含 `run_id`、状态、结果、错误、耗时） |
-| `NodeReport` | 单节点统计（处理数、错误数、耗时分布） |
-| `RunStorage` | 历史运行状态管理接口（`get` / `list` / `clear`） |
-| `RunStorageBackend` | 可插拔存储后端抽象基类 |
-| `InMemoryStorage` | 默认 LRU 内存后端（`max_runs=100`） |
+| 类 / 函数              | 说明                                             |
+| ---------------------- | ------------------------------------------------ |
+| `@node` / `node(...)`  | 将函数包装为节点                                 |
+| `BaseNode`             | 类式节点基类，重写 `process(ctx)`                |
+| `Pipeline(name)`       | 创建流水线                                       |
+| `Pipeline \| node`     | 添加节点                                         |
+| `Pipeline.run(*items)` | 同步运行，返回 `PipelineReport`                  |
+| `Pipeline.storage`     | `RunStorage` 实例，管理所有历史运行状态          |
+| `Context`              | item + 共享元数据容器                            |
+| `PipelineReport`       | 运行报告（含 `task_id`、状态、结果、错误、耗时） |
+| `NodeReport`           | 单节点统计（处理数、错误数、耗时分布）           |
+| `RunStorage`           | 历史运行状态管理接口（`get` / `list` / `clear`） |
+| `RunStorageBackend`    | 可插拔存储后端抽象基类                           |
+| `InMemoryStorage`      | 默认 LRU 内存后端（`max_runs=100`）              |
 
 详细文档见 [docs/](docs/)。
 
 ## RunStorage — 历史运行管理
 
-每次 `run()` / `run_background()` / `start()` 都会生成唯一的 `run_id`（UUID4），运行状态和报告自动存入 `pipeline.storage`：
+每次 `run()` / `run_background()` / `start()` 都会生成唯一的 `task_id`（UUID4），运行状态和报告自动存入 `pipeline.storage`：
 
 ```python
 report1 = pipeline.run("hello")
 report2 = pipeline.run("world")
 
-# 每个报告携带唯一 run_id
-print(report1.run_id)   # 'a1b2c3d4-...'
-print(report2.run_id)   # 'e5f6g7h8-...'
+# 每个报告携带唯一 task_id
+print(report1.task_id)   # 'a1b2c3d4-...'
+print(report2.task_id)   # 'e5f6g7h8-...'
 
-# 列出所有历史 run_id（oldest → newest）
+# 列出所有历史 task_id（oldest → newest）
 for rid in pipeline.storage.list():
     state = pipeline.storage.get(rid)
     print(rid, state.report.status)
 
-# 按 run_id 查询
-state = pipeline.storage[report1.run_id]
+# 按 task_id 查询
+state = pipeline.storage[report1.task_id]
 print(state.report.results)
 
 # 自定义存储后端（如 SQLite、Redis）
 class MyBackend(rivus.RunStorageBackend):
-    def save(self, run_id, state): ...
-    def get(self, run_id): ...
+    def save(self, task_id, state): ...
+    def get(self, task_id): ...
     def list(self): ...
     def clear(self): ...
 
