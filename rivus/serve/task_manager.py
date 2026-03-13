@@ -1,25 +1,4 @@
-"""TaskManager：框架无关的任务生命周期管理器。
-
-职责
-----
-- 接收同步 / 异步任务提交，驱动 Pipeline 执行
-- 维护所有 HTTP 层任务的 TaskRecord（状态、结果、时间戳）
-- 支持按 task_id 取消正在运行的任务
-- 支持按 status 过滤任务列表
-
-并发模型
---------
-Pipeline.create_run() 并发安全，每次 run 拥有独立的 Task 实例。
-
-- 同步提交（mode=sync）：在当前调用线程中直接调用 pipeline.run()，HTTP handler 阻塞等待
-- 异步提交（mode=async）：在独立 daemon 线程中调用 pipeline.run()，
-  HTTP handler 立即返回 task_id
-
-取消机制
---------
-task_id → TaskRecord.task → Task.stop()
-TaskManager 通过持有 Task 引用实现精准取消，无需额外状态。
-"""
+"""TaskManager：框架无关的任务生命周期管理器"""
 
 from __future__ import annotations
 
