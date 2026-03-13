@@ -1,20 +1,4 @@
-"""Sanic HTTP 服务器实现。
-
-路由布局（以 prefix="/api", pipelines=["demo","classify"] 为例）::
-
-    GET  /api/heartbeat
-    POST /api/shutdown
-    POST /api/demo/tasks?mode=sync|async
-    GET  /api/demo/tasks?status=all|running|done|failed|cancelled
-    GET  /api/demo/tasks/<task_id>
-    DELETE /api/demo/tasks/<task_id>
-    POST /api/classify/tasks?mode=sync|async
-    ...（classify 同上）
-
-Sanic 的 handler 必须是 async 函数，但 Pipeline.run() 是同步阻塞的。
-同步模式（mode=sync）在 loop.run_in_executor 中执行，避免阻塞事件循环。
-异步模式（mode=async）使用 loop.run_in_executor 启动后台线程后立即返回。
-"""
+"""Sanic HTTP 服务器实现"""
 
 from __future__ import annotations
 

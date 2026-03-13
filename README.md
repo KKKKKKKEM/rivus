@@ -205,7 +205,7 @@ pipeline.serve(host="0.0.0.0", port=8080, prefix="/api/v1")
 }
 ```
 
-异步提交时加 `?mode=async`，立即返回 `task_id`，之后通过 `GET /tasks/{task_id}` 轮询结果。
+异步提交时加 `在 body 设置 timeout: 0`，立即返回 `task_id`，之后通过 `GET /tasks/{task_id}` 轮询结果。
 
 ## 示例
 
