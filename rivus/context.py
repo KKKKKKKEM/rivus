@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from threading import RLock
 from typing import Any, TypeVar, overload
 
@@ -16,11 +17,14 @@ class Context:
         initial: dict[str, Any] | None = None,
         root: Context | None = None,
     ) -> None:
-        self._lock = RLock()
-        self._id = id(self)  # unique identifier for this Context instance
+        # 子 Context 复用 root 的锁，减少 OS mutex 创建开销
         self._root: Context = root or self
+        self._lock = root._lock if root is not None else RLock()
+        self._id = id(self)  # unique identifier for this Context instance
         self.input: Any = None
         self.error: Exception | None = None
+        # 每个 root Context 持有一个 Event，用于快速 need_stop 检测
+        self._stop_event: threading.Event = root._stop_event if root is not None else threading.Event()
 
         for key, value in (initial or {}).items():
             setattr(self, key, value)
@@ -73,15 +77,13 @@ class Context:
     def cancel(self):
         with self._lock:
             self.error = Exception("Task cancelled")
+            self._stop_event.set()
 
     @property
     def need_stop(self) -> bool:
-        with self._lock:
-            need_stop = self.error is not None
-            if not need_stop and self._root is not self:
-                need_stop = self._root.need_stop
-
-            return need_stop
+        if self._stop_event.is_set():
+            return True
+        return self.error is not None
     # ------------------------------------------------------------------
     # Dunder helpers
     # ------------------------------------------------------------------

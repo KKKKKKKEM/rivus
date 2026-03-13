@@ -94,12 +94,17 @@ class Node:
             try:
                 stuff = self.fn(ctx)
 
-                if not self.is_generator:
-                    stuff = [stuff]
-
-                for item in stuff:
+                if self.is_generator:
+                    for item in stuff:
+                        if item is None:
+                            item = ctx
+                        elif not isinstance(item, Context):
+                            item = ctx.derive(input=item)
+                        self.follow2next(item)
+                else:
+                    item = stuff
                     if item is None:
-                        item = ctx  # pass-through
+                        item = ctx
                     elif not isinstance(item, Context):
                         item = ctx.derive(input=item)
                     self.follow2next(item)

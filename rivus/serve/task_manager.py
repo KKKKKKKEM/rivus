@@ -109,7 +109,7 @@ class TaskManager:
                 record.status = "done" if record.status != "cancelled" else "cancelled"
             except Exception as exc:
                 record.status = "failed"
-                record.error = str(object=exc)
+                record.error = str(exc)
             finally:
                 record.finish_at = time.time()
 
