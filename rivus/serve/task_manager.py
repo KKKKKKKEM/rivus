@@ -84,8 +84,13 @@ class TaskManager:
 
         def start():
             try:
-                record.results = self._pipeline.run(ctx, timeout=req.timeout)
-                record.status = "done" if record.status != "cancelled" else "cancelled"
+                results = self._pipeline.run(ctx, timeout=req.timeout)
+                if ctx.error is not None:
+                    record.error = str(ctx.error)
+                    record.status = "failed"
+                else:
+                    record.results = list(results)
+                    record.status = "done" if record.status != "cancelled" else "cancelled"
             except Exception as exc:
                 record.status = "failed"
                 record.error = str(exc)

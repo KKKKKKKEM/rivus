@@ -8,6 +8,7 @@ import rivus
 @rivus.node
 def step1(ctx: rivus.Context):
     para = ctx.input
+    1/0
     resource = ctx.get("resource", "N/A")
     logger.debug(f"Step 1 processing: {para}  resource={resource}")
     return "result from step 1"
@@ -37,9 +38,9 @@ if __name__ == "__main__":
     pipeline.add_nodes(step1, step2, step3)
 
     # 非流式输出模式
-    results = pipeline.run("my_input")
-    for item in results:
-        logger.info(f"Final output: {item}")
+    # results = pipeline.run("my_input")
+    # for item in results:
+    #     logger.info(f"Final output: {item}")
     
     
     # 流式输出模式
@@ -47,6 +48,6 @@ if __name__ == "__main__":
     #     logger.info(f"Final output: {item}")
     
     # rpc 模式
-    # pipeline.serve(port=9997)
+    pipeline.serve(port=8800)
     
     

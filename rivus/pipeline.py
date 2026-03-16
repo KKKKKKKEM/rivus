@@ -15,6 +15,7 @@
 - ``None``   → 当前 ctx 原样传下游（pass-through / 副作用节点）
 - ``Context``→ 直接传下游（用户手动控制派生）
 - ``yield``  → 每个值派生为独立 item（fan-out，一进多出）
+- ``(key, value)`` → 路由模式，按 key 选择下游分支
 
 节点间传递模式
 --------------
@@ -38,6 +39,32 @@ Gather 模式（``gather=True``）
             all_results = ctx.require("input")  # list
             return summarize(all_results)
 
+分叉与合并
+----------
+广播分叉（broadcast，默认）
+    上游每产出一个 item，同时推送到所有分支，每个分支独立处理同一份 ctx。
+    适合并行加工同一数据::
+
+        pipeline.add_node(parse).branch(enrich_a, enrich_b).join(summarize)
+
+路由分叉（route）
+    节点函数返回 ``(branch_key, value)``，框架按 branch_key 路由到对应分支。
+    适合按条件分流::
+
+        @node
+        def classify(ctx):
+            if is_pdf(ctx.input):
+                return ("pdf", ctx.input)
+            return ("txt", ctx.input)
+
+        pipeline.add_node(classify).branch(handle_pdf, handle_txt, mode="route")
+
+Join 合并
+    将多个并行分支汇入同一下游节点。配合 ``gather=True`` 可等所有分支完成后
+    将结果聚合成列表再处理::
+
+        pipeline.branch(a, b).join(reduce_node, gather=True)
+
 两种运行模式
 ------------
 - 批量：``run(*items)``
@@ -51,8 +78,7 @@ from __future__ import annotations
 import contextlib
 import threading
 from collections import deque
-from typing import Any, Callable, Generator
-from unittest import result
+from typing import Any, Callable, Generator, Iterable, Literal
 
 from rivus.context import Context
 from rivus.node import Node
@@ -72,13 +98,12 @@ class Pipeline:
         initial: dict[str, Any] | None = None,
         nodes: list[Node] | None = None,
         on_result: Callable[['Pipeline', deque[Context],
-                             Context], list[object]] | None = None,
+                             Context], Iterable[Any]] | None = None,
     ) -> None:
         self.name = name
         self._nodes: list[Node] = nodes or []
         self.initial = initial or {}
 
-        # 全局变量存储（Pipeline 生命周期内跨 run 共享）
         self._vars: dict[str, Any] = {}
         self._vars_lock = threading.Lock()
         self.semaphore = threading.Semaphore(
@@ -89,7 +114,13 @@ class Pipeline:
         self._on_run_end: list[Callable[["Context"], None]] = []
         self._started = False
         self._startup_lock = threading.Lock()
-        self.on_result = on_result or (lambda _, results, ctx: [i.input for i in results])
+        self.on_result = on_result or (lambda _, results, ctx: [
+                                       i.input for i in results])
+
+        # DAG builder 状态
+        self._tail: Node | None = None                  # 当前链尾
+        self._pending_branches: list[Node] = []         # 等待 join 的分支末端
+        self._edges: list[tuple[Node, Node]] = []       # 有向边列表 (src, dst)
 
     # ------------------------------------------------------------------
     # 全局变量 API
@@ -143,6 +174,9 @@ class Pipeline:
     # Builder API
     # ------------------------------------------------------------------
 
+    def _connect(self, src: Node, dst: Node) -> None:
+        self._edges.append((src, dst))
+
     def add_node(self, n: "Node") -> "Pipeline":
         """追加节点，返回 self 支持链式调用。"""
         if not isinstance(n, Node):
@@ -150,13 +184,142 @@ class Pipeline:
                 f"Expected Node, got {type(n).__name__!r}. "
                 "Use @node decorator."
             )
+        if self._pending_branches:
+            raise RuntimeError(
+                "There are pending branches waiting for join(). "
+                "Call join() before add_node()."
+            )
+
+        if self._tail is not None:
+            self._connect(self._tail, n)
+        # else: 第一个节点，_upstream_count 由 _build_workers 设为 1
+
         self._nodes.append(n)
+        self._tail = n
         return self
 
     def add_nodes(self, *nodes: "Node") -> "Pipeline":
         """追加多个节点，返回 self 支持链式调用。"""
         for n in nodes:
             self.add_node(n)
+        return self
+
+    def branch(
+        self,
+        *args: "Node | Pipeline",
+        mode: Literal["broadcast", "route"] = "broadcast",
+    ) -> "Pipeline":
+        """从当前尾节点开叉，创建多个并行分支。
+
+        Args:
+            *args:  分支，至少 2 个。每个分支可以是：
+
+                    - :class:`Node` — 单节点分支；
+                    - :class:`Pipeline` — 子流水线分支（支持任意深度嵌套）。
+
+                    当传入 ``Pipeline`` 时，子流水线必须已完全定义（无 pending branches）。
+                    子流水线的所有节点会被平展合并到主流水线中。
+
+            mode:   ``"broadcast"`` 每个 item 广播到所有分支；
+                    ``"route"`` 节点函数返回 ``(branch_key, value)`` 按名称路由。
+
+        Examples::
+
+            # 普通节点分支
+            pipeline.add_node(parse).branch(enrich_a, enrich_b).join(merge)
+
+            # Pipeline 子图分支（支持嵌套）
+            branch_a = Pipeline().add_nodes(enrich_a, clean_a)
+            branch_b = Pipeline().add_nodes(enrich_b, clean_b)
+            pipeline.add_node(parse).branch(branch_a, branch_b).join(merge)
+
+            # 混合 Node / Pipeline
+            pipeline.add_node(parse).branch(enrich_a, branch_b).join(merge)
+        """
+        if self._tail is None:
+            raise RuntimeError(
+                "branch() requires at least one preceding node.")
+        if self._pending_branches:
+            raise RuntimeError(
+                "There are pending branches waiting for join(). "
+                "Call join() before branch()."
+            )
+        if len(args) < 2:
+            raise ValueError("branch() requires at least 2 branch arguments.")
+
+        self._tail.branch_mode = mode
+
+        for arg in args:
+            if isinstance(arg, Node):
+                head_node = arg
+                tail_node = arg
+                self._nodes.append(arg)
+
+            elif isinstance(arg, Pipeline):
+                if not arg._nodes:
+                    raise ValueError(
+                        "Branch Pipeline must have at least one node.")
+                if arg._pending_branches:
+                    raise RuntimeError(
+                        "Branch Pipeline has unjoined branches. "
+                        "Call join() to complete it before using as a branch."
+                    )
+                if arg._tail is None:
+                    raise RuntimeError(
+                        "Branch Pipeline has no tail node. "
+                        "Make sure it has at least one node and all branches are joined."
+                    )
+                # 子图头节点：_upstream_count == 0 的第一个节点
+                head_node = next(
+                    (n for n in arg._nodes if n not in {
+                     dst for _, dst in arg._edges}),
+                    arg._nodes[0],
+                )
+                tail_node = arg._tail
+                self._nodes.extend(arg._nodes)
+                self._edges.extend(arg._edges)
+
+            else:
+                raise TypeError(
+                    f"Expected Node or Pipeline, got {type(arg).__name__!r}."
+                )
+
+            self._connect(self._tail, head_node)
+            self._pending_branches.append(tail_node)
+
+        self._tail = None
+        return self
+
+    def join(
+        self,
+        n: "Node",
+        *,
+        gather: bool = False,
+    ) -> "Pipeline":
+        """将所有待合并分支汇入节点 n。
+
+        Args:
+            n:       合并目标节点。
+            gather:  ``True`` 时等所有分支完成后将结果收集为 list 再处理；
+                     ``False`` 时流式接收（先完成先处理）。
+        """
+        if not self._pending_branches:
+            raise RuntimeError("join() requires a preceding branch().")
+        if not isinstance(n, Node):
+            raise TypeError(
+                f"Expected Node, got {type(n).__name__!r}. "
+                "Use @node decorator."
+            )
+
+        if gather:
+            n.gather = True
+
+        for branch_end in self._pending_branches:
+            self._connect(branch_end, n)
+
+        self._nodes.append(n)
+        self._pending_branches = []
+        self._tail = n
         return self
 
     # ------------------------------------------------------------------
@@ -170,18 +333,78 @@ class Pipeline:
     def _build_workers(self, item: object) -> tuple[Context, Node, Node, Node]:
         if not self._nodes:
             raise RuntimeError(f"Pipeline '{self.name}' has no nodes.")
+        if self._pending_branches:
+            raise RuntimeError(
+                f"Pipeline '{self.name}' has unjoined branches. "
+                "Call join() to complete the DAG."
+            )
 
-        res = Node(lambda x: x, name="__collector__")
-        nodes_snapshot = [n.snapshot() for n in self._nodes]
-        nodes_length = len(nodes_snapshot)
+        # collector 是被动存储节点：不启动 worker，数据直接 submit 进 task_queue
+        # 当所有叶节点都 done() 后，直接 set shutdown event
+        collector = Node(lambda x: x, name="__collector__")
 
-        for idx, node in enumerate(nodes_snapshot):
-            node.next = nodes_snapshot[idx +
-                                       1] if idx + 1 < nodes_length else res
-            node.start()
+        def _collector_done(self=collector) -> None:
+            with collector._done_lock:
+                collector._done_received += 1
+                if collector._done_received >= collector._upstream_count:
+                    collector.shutdown.set()
 
-        head, tail = nodes_snapshot[0], nodes_snapshot[-1]
+        collector.done = _collector_done  # type: ignore[method-assign]
 
+        # 1. 为所有节点创建快照（不含 DAG 连接）
+        orig_to_snap: dict[Node, Node] = {
+            n: n.snapshot() for n in self._nodes
+        }
+
+        # 2. 从 _edges 重建 DAG 连接（在快照上）
+        for src_orig, dst_orig in self._edges:
+            src_snap = orig_to_snap[src_orig]
+            dst_snap = orig_to_snap[dst_orig]
+            src_snap.nexts.append(dst_snap)
+            dst_snap._upstream_count += 1
+
+        # 复制各节点的 branch_mode
+        for orig, snap in orig_to_snap.items():
+            snap.branch_mode = orig.branch_mode
+
+        # 3. 找出度为 0 的节点（叶节点），接到 collector
+        dst_set = {dst_orig for _, dst_orig in self._edges}
+        src_set = {src_orig for src_orig, _ in self._edges}
+        leaves: list[Node] = [
+            orig_to_snap[n] for n in self._nodes if n not in src_set
+        ]
+        for leaf in leaves:
+            leaf.nexts.append(collector)
+            collector._upstream_count += 1
+
+        # 4. 头节点（无入边）的 _upstream_count 来自外部 submit，固定为 1
+        heads_orig = [n for n in self._nodes if n not in dst_set]
+        for orig in heads_orig:
+            snap = orig_to_snap[orig]
+            if snap._upstream_count == 0:
+                snap._upstream_count = 1
+
+        if collector._upstream_count == 0:
+            collector._upstream_count = 1
+
+        # 5. 启动所有快照节点
+        for snap in orig_to_snap.values():
+            snap.start()
+
+        # 6. 找入口节点（head）
+        if heads_orig:
+            head = orig_to_snap[heads_orig[0]]
+        else:
+            head = orig_to_snap[self._nodes[0]]
+
+        # 7. 找 tail（出度为 0 的最后一个节点）
+        tail_orig = next(
+            (n for n in reversed(self._nodes) if n not in src_set),
+            self._nodes[-1]
+        )
+        tail = orig_to_snap[tail_orig]
+
+        # 8. 构造初始 ctx 并提交
         if isinstance(item, Context):
             ctx = item
         else:
@@ -192,28 +415,28 @@ class Pipeline:
 
         head.submit(ctx)
         head.done()
-        return ctx, head, tail, res
+        return ctx, head, tail, collector
 
-    def run(self, item: object, timeout: float | None = None) -> list[object]:
+    def run(self, item: object, timeout: float | None = None) -> Iterable[Any]:
         self._fire_startup()
         with self.semaphore:
-            ctx, _, tail, res = self._build_workers(item)
+            ctx, _, tail, collector = self._build_workers(item)
             try:
-                tail.wait(timeout=timeout)
-                return self.on_result(self, res.task_queue.queue, ctx)
+                collector.wait(timeout=timeout)
+                return self.on_result(self, collector.task_queue.queue, ctx)
             finally:
                 self._fire_run_end(ctx)
 
     def stream(self, item: object) -> Generator[Context, Any, None]:
         self._fire_startup()
         with self.semaphore:
-            ctx, _, tail, res = self._build_workers(item)
+            ctx, _, tail, collector = self._build_workers(item)
             try:
                 while True:
                     try:
-                        yield res.task_queue.get(timeout=1)
+                        yield collector.task_queue.get(timeout=1)
                     except Exception:
-                        if not tail.shutdown.is_set():
+                        if not collector.shutdown.is_set():
                             continue
                         else:
                             break

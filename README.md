@@ -20,7 +20,7 @@ items → wrap(ctx) → Q → [Node A, workers=W] → Q → [Node B, workers=W] 
 ## 安装
 
 ```bash
-pip install -U git+https://github.com/KKKKKKKEM/rivus.git
+pip install -U git+http://rdgit.300624.cn/wankai20/rivus
 ```
 
 ## 快速上手
@@ -160,24 +160,24 @@ pipeline = rivus.Pipeline(
 
 ## API 参考
 
-| 类 / 函数 | 说明 |
-|-----------|------|
-| `@node` / `node(workers=N)` | 将函数包装为节点 |
-| `Pipeline(name, max_workers, initial, on_result)` | 创建流水线 |
-| `pipeline.add_node(node)` | 追加单个节点 |
-| `pipeline.add_nodes(*nodes)` | 追加多个节点 |
-| `pipeline.run(item, timeout)` | 同步运行单个 item，返回结果列表 |
-| `pipeline.stream(item)` | 流式运行，返回 `Context` 生成器 |
-| `pipeline.serve(host, port, prefix)` | 启动 HTTP 服务（阻塞） |
-| `pipeline.set(key, value)` | 写入 Pipeline 级全局变量 |
-| `pipeline.get(key, default)` | 读取 Pipeline 级全局变量 |
-| `Context` | item + 共享元数据容器 |
-| `ctx.input` | 当前 item 值 |
-| `ctx.error` | 当前 item 的错误（`None` 表示正常） |
-| `ctx.get(key, default)` | 读取元数据，自动向上查找 root |
-| `ctx.require(key)` | 读取元数据，不存在则抛 `KeyError` |
-| `ctx.set(key, value)` | 写入元数据（线程安全） |
-| `ctx.cancel()` | 广播取消信号，终止整条流水线 |
+| 类 / 函数                                         | 说明                                |
+| ------------------------------------------------- | ----------------------------------- |
+| `@node` / `node(workers=N)`                       | 将函数包装为节点                    |
+| `Pipeline(name, max_workers, initial, on_result)` | 创建流水线                          |
+| `pipeline.add_node(node)`                         | 追加单个节点                        |
+| `pipeline.add_nodes(*nodes)`                      | 追加多个节点                        |
+| `pipeline.run(item, timeout)`                     | 同步运行单个 item，返回结果列表     |
+| `pipeline.stream(item)`                           | 流式运行，返回 `Context` 生成器     |
+| `pipeline.serve(host, port, prefix)`              | 启动 HTTP 服务（阻塞）              |
+| `pipeline.set(key, value)`                        | 写入 Pipeline 级全局变量            |
+| `pipeline.get(key, default)`                      | 读取 Pipeline 级全局变量            |
+| `Context`                                         | item + 共享元数据容器               |
+| `ctx.input`                                       | 当前 item 值                        |
+| `ctx.error`                                       | 当前 item 的错误（`None` 表示正常） |
+| `ctx.get(key, default)`                           | 读取元数据，自动向上查找 root       |
+| `ctx.require(key)`                                | 读取元数据，不存在则抛 `KeyError`   |
+| `ctx.set(key, value)`                             | 写入元数据（线程安全）              |
+| `ctx.cancel()`                                    | 广播取消信号，终止整条流水线        |
 
 ## HTTP 服务
 
@@ -187,14 +187,14 @@ pipeline.serve(host="0.0.0.0", port=8080, prefix="/api/v1")
 
 启动后可通过 RESTful 接口远程提交和管理任务：
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| `GET` | `/api/v1/health` | 心跳检测 |
-| `POST` | `/api/v1/tasks` | 提交任务（同步或异步） |
-| `GET` | `/api/v1/tasks` | 任务列表（可按 status 过滤） |
-| `GET` | `/api/v1/tasks/{task_id}` | 查询单个任务状态 |
-| `DELETE` | `/api/v1/tasks/{task_id}` | 取消任务 |
-| `POST` | `/api/v1/shutdown` | 关闭服务 |
+| 方法     | 路径                      | 说明                         |
+| -------- | ------------------------- | ---------------------------- |
+| `GET`    | `/api/v1/health`          | 心跳检测                     |
+| `POST`   | `/api/v1/tasks`           | 提交任务（同步或异步）       |
+| `GET`    | `/api/v1/tasks`           | 任务列表（可按 status 过滤） |
+| `GET`    | `/api/v1/tasks/{task_id}` | 查询单个任务状态             |
+| `DELETE` | `/api/v1/tasks/{task_id}` | 取消任务                     |
+| `POST`   | `/api/v1/shutdown`        | 关闭服务                     |
 
 提交任务请求体（JSON）：
 
@@ -205,11 +205,11 @@ pipeline.serve(host="0.0.0.0", port=8080, prefix="/api/v1")
 }
 ```
 
-异步提交时加 `在 body 设置 timeout: 0`，立即返回 `task_id`，之后通过 `GET /tasks/{task_id}` 轮询结果。
+异步提交时 `在 body 设置 timeout: 0`，立即返回 `task_id`，之后通过 `GET /tasks/{task_id}` 轮询结果。
 
 ## 示例
 
-完整示例见 [demo/demo1.py](demo/demo1.py)。
+完整示例见 [example/demo1.py](example/demo1.py)。
 
 ## License
 

@@ -79,11 +79,6 @@ class Context:
             self.error = Exception("Task cancelled")
             self._stop_event.set()
 
-    @property
-    def need_stop(self) -> bool:
-        if self._stop_event.is_set():
-            return True
-        return self.error is not None
     # ------------------------------------------------------------------
     # Dunder helpers
     # ------------------------------------------------------------------
